@@ -1,0 +1,2619 @@
+---
+title: "SomaScan_batch1_2_final_YL"
+author: "Youkyung Lim"
+date: '2022-06-11'
+output: html_document
+---
+
+# Final Analysis
+## Data Loading, Wrangling - clinical data, SomaScan data
+
+### Install
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width = 100)
+set.seed(23112021)   # set seed
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.path = "output/fig/"
+ )
+
+setRepositories(addURL=c(CRAN="http://cloud.r-project.org/"),  ind =TRUE )
+if (!suppressWarnings(require("pacman", character.only = TRUE))) {install.packages("pacman", dependencies = TRUE) }
+if (!suppressWarnings(require("BiocManager", character.only = TRUE))) {pacman::p_install("BiocManager") }
+
+if (!suppressWarnings(require("devtools", character.only = TRUE))) {pacman::p_install(devtools)}
+
+if (!suppressWarnings(require("SomaDataIO", character.only = TRUE))) {
+  devtools::install_github("SomaLogic/SomaDataIO@*release")
+}
+
+pacman::p_load(SomaDataIO, ggplot2, ggfortify, dplyr, tidyr, purrr, Biobase, ggrepel, NbClust, readxl, readr, writexl, tidyverse, beeswarm, pheatmap, RColorBrewer, Rtsne, limma)
+
+```
+
+
+### Load Clinical Data 
+```{r Load Clinical Data }
+idir1 <- "../../../../vdrive/Data_sharing_metadata/ImmunAIDClinicalData/"
+ifiles1 <- list.files(idir1, pattern = ".*export\\.csv$") 
+ifiles1
+
+# add a column for the file name
+cdata <- list()
+for(ifile in ifiles1) {
+  cbatch <- read_delim(paste0(idir1,ifile),delim = "\t")
+  cbatch$file <- ifile
+  cdata <- rbind(cdata,cbatch)
+}
+rm(cbatch)
+# cdata # 222 rows
+
+# check duplicated rows
+dup <- cdata[duplicated(cdata$`ImmunAID identifier`),]$`ImmunAID identifier` # 9 IDs
+# cdata[cdata$`ImmunAID identifier` == dup[1],]
+rm(dup)
+cdata <- cdata[!duplicated(cdata$`ImmunAID identifier`),] # 213 rows
+
+# add two columns for full name & abbreviation of the diseases
+cdata$Disease_sm <- sub(" $","",sub("\\(.*","",cdata$Disease))
+cdata$Disease_gr <- gsub("\\(|\\)","",sub(".*\\(","\\(",cdata$Disease))
+
+# add a column for the classification of clinical centers
+cdata$Clinic_num <- str_sub(cdata$`Clinical center`, start= 1, end = 2)
+
+# cdata # 213 x 29
+```
+
+```{r Load Submission Form}
+idir2 <-   "../../../../vdrive/Data_sharing_metadata/SomaLogic/Submission form/"
+ifiles2 <- list.files(idir2, pattern = "*SSF.xlsx$")
+# ifiles2
+
+names(ifiles2) <- c("SS-2213415", "SS-2213416", "SS-216952", "SS-216953") # project 3, 4, 1, 2
+ifiles2 <- ifiles2[sort(names(ifiles2))] # reorder
+ifiles2
+
+# format of project 1/2 and 3/4 are different
+# project 1/2
+forml <-list()
+for(i in 1:2) {
+  forml[names(ifiles2)[i]] <- na.omit(readxl::read_xlsx(paste0(idir2,ifiles2[i]), sheet=1, range="C37:C10000")) # note starts with 37
+}
+
+# project 3/4
+# sheet 2
+# 4 : Tube Unique ID/2D Barcode (First Replicate) : 22002A02PL1 --> 22002A
+# 20 : Internal Study ID : SS-2213415
+for(i in 3:4) {
+  forml[names(ifiles2)[i]] <- readxl::read_xlsx(paste0(idir2,ifiles2[i]), sheet=2)[,4]
+}
+forml$`SS-2213415` <- str_sub(forml$`SS-2213415`, start= 1, end = 6)
+forml$`SS-2213416` <- str_sub(forml$`SS-2213416`, start= 1, end = 6)
+
+formd <- utils::stack(forml)
+names(formd) <- c("SampleId","SSID") 
+formd$`ImmunAID identifier` <- sub("A|B$","",formd$SampleId)
+formd$'label' <- str_sub(formd$SampleId, start= -1) # SampleId = ImmunAID identifier + label (A or B)
+
+# formd # 160 x 4
+
+```
+
+
+```{r check labels}
+# label A: before treatment / B: after treatment
+bp <- barplot(table(formd$label), main = paste0("# of labels (N = ", sum(table(formd$label)), ")"), cex.names=0.8, xlab = "Before (A) / After (B) treatments")
+text(bp, 7, table(formd$label), cex=1)
+
+# formd
+```
+
+
+```{r merge clinical data + submission form via \'ImmunAID identifier\'}
+## merge clinical data + submission form via 'ImmunAID identifier'
+cdatas <- merge(cdata, formd, by = 'ImmunAID identifier') 
+
+dim(cdatas)
+# cdatas
+# 213 + 160 --> 156 (A, B)
+# 213 + 143 --> 140 (A only)
+```
+
+```{r 4 samples without clinical info}
+'%notin%' <- Negate('%in%')
+formd[formd$`ImmunAID identifier` %notin% cdata$`ImmunAID identifier`,]
+```
+
+### Load SomaScan Data (batch 1, 2)
+
+```{r Load SomaScan data batch 1 + add meta data}
+
+idatdir <- "../../../../raw/SomaLogic/batch_1_sep_2021" # SS-216952, SS-216953
+sfiles <- list.files(idatdir, pattern = "^SS.*\\.adat$")
+sfiles
+
+datal <-list()
+for(ssid in names(forml)[1:2]) {
+  # 'raw' = non-core matrix
+  datal[[ssid]][["raw"]] <- SomaDataIO::read.adat(paste(idatdir,grep(paste0(ssid,".*PRENORM"), sfiles, value = TRUE), sep = "/"))
+  # 'norm' = core matrix
+   datal[[ssid]][["norm"]] <- SomaDataIO::read.adat(paste(idatdir,grep(paste0(ssid,".*FINAL"), sfiles, value = TRUE), sep = "/"))
+  # add clinical data
+  datal[[ssid]][["norm"]]$Disease   <- cdatas$Disease_sm[match(datal[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["raw"]]$Disease    <- cdatas$Disease_sm[match(datal[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["norm"]]$CRP       <- cdatas$`V1 - CRP mg/L`[match(datal[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["raw"]]$CRP        <- cdatas$`V1 - CRP mg/L`[match(datal[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["norm"]]$Clinic_num <- cdatas$Clinic_num[match(datal[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["raw"]]$Clinic_num  <- cdatas$Clinic_num[match(datal[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["norm"]]$Age      <- cdatas$Age[match(datal[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["raw"]]$Age       <- cdatas$Age[match(datal[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["norm"]]$Gender   <- cdatas$Gender[match(datal[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["raw"]]$Gender    <- cdatas$Gender[match(datal[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["norm"]]$Fever <- cdatas$`V1 – Fever`[match(datal[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["raw"]]$Fever <- cdatas$`V1 – Fever`[match(datal[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+    datal[[ssid]][["norm"]]$label <- cdatas$label[match(datal[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal[[ssid]][["raw"]]$label <- cdatas$label[match(datal[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+  }
+
+sapply(datal,function(x) {sapply (x, is.soma_adat)})
+sapply(datal,function(x) {sapply (x, is.intact.attributes)})
+
+# datal # 4 lists of 48 x 7635
+```
+
+
+```{r Load SomaScan data batch 2 + add meta data}
+
+idatdir2 <- "../../../../raw/SomaLogic/batch_2_may_2022" # SS-2213415, SS-2213416 
+# v4.1_EDTA_Plasma.hybNorm.medNormInt.plateScale.calibration.anolQC.qcCheck(.anmlSMP).adat
+
+sfiles2 <- list.files(idatdir2, pattern = "^SS.*\\.adat$")
+sfiles2
+
+datal2 <- list()
+for(ssid in names(forml)[3:4]) {
+  # 'raw' = non-core matrix
+  datal2[[ssid]][["raw"]] <- SomaDataIO::read.adat(paste(idatdir2,grep(paste0(ssid,".*qcCheck.adat"), sfiles2, value = TRUE), sep = "/"))
+  # 'norm' = core matrix
+   datal2[[ssid]][["norm"]] <- SomaDataIO::read.adat(paste(idatdir2,grep(paste0(ssid,".*qcCheck.anmlSMP.adat"), sfiles2, value = TRUE), sep = "/"))
+}
+
+# 02003A02PL1 --> 02003A
+datal2$`SS-2213415`$raw$SampleId <- str_sub(datal2$`SS-2213415`$raw$SampleId, start= 1, end = 6)
+datal2$`SS-2213416`$raw$SampleId <- str_sub(datal2$`SS-2213416`$raw$SampleId, start= 1, end = 6)
+datal2$`SS-2213415`$norm$SampleId <- str_sub(datal2$`SS-2213415`$norm$SampleId, start= 1, end = 6)
+datal2$`SS-2213416`$norm$SampleId <- str_sub(datal2$`SS-2213416`$norm$SampleId, start= 1, end = 6)
+
+for(ssid in names(forml)[3:4]) {
+  # add clinical data
+  datal2[[ssid]][["norm"]]$Disease <- cdatas$Disease_sm[match(datal2[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["raw"]]$Disease <- cdatas$Disease_sm[match(datal2[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["norm"]]$CRP <- cdatas$`V1 - CRP mg/L`[match(datal2[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["raw"]]$CRP <- cdatas$`V1 - CRP mg/L`[match(datal2[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["norm"]]$Clinic_num <- cdatas$Clinic_num[match(datal2[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["raw"]]$Clinic_num <- cdatas$Clinic_num[match(datal2[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["norm"]]$Age <- cdatas$Age[match(datal2[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["raw"]]$Age <- cdatas$Age[match(datal2[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["norm"]]$Gender <- cdatas$Gender[match(datal2[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["raw"]]$Gender <- cdatas$Gender[match(datal2[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["norm"]]$Fever <- cdatas$`V1 – Fever`[match(datal2[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["raw"]]$Fever <- cdatas$`V1 – Fever`[match(datal2[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+      datal2[[ssid]][["norm"]]$label <- cdatas$label[match(datal2[[ssid]][["norm"]]$SampleId,cdatas$SampleId)]
+  datal2[[ssid]][["raw"]]$label <- cdatas$label[match(datal2[[ssid]][["raw"]]$SampleId,cdatas$SampleId)]
+
+
+  }
+sapply(datal2,function(x) {sapply (x, is.soma_adat)})
+sapply(datal2,function(x) {sapply (x, is.intact.attributes)})
+
+# datal2 # 56 x 7632
+```
+
+
+### Merge SomaScan raw data, select Sample, Human, Protein
+
+```{r merge \'raw\' datasets, Sample & Human & Protein}
+mergedDataRaw <- bind_rows(datal[[1]][["raw"]], datal[[2]][["raw"]], datal2[[1]][["raw"]], datal2[[2]][["raw"]]) %>% # 208 rows
+  filter(SampleType == "Sample") %>% # 143 rows # rm control samples
+  tidyr::drop_na(Disease) %>%         # 140 rows # rm NAs if present
+  dplyr::mutate(Control = factor(ifelse(Disease == "Negative control", "Yes","No"))) %>% # add Control column based on disease
+ .[, getAnalyteInfo(.)$Organism == 'Human'] %>%
+ .[, getAnalyteInfo(.)$Type == "Protein"]
+
+# mergedDataRaw
+dim(mergedDataRaw)
+```
+
+
+```{r clean CRP column}
+# remove trailing ###, take the first CRP value when there are two values, 
+mergedDataRaw$CRP <- str_split( sub("#{1,}$","", mergedDataRaw$CRP), '#', simplify = TRUE )[,1]
+mergedDataRaw$CRP[mergedDataRaw$CRP == "" ] <- NA
+mergedDataRaw$CRP <- as.numeric(mergedDataRaw$CRP)
+
+# cdatas$'V1 - SAA level mg/L' # too many missing values
+```
+
+```{r color scheme for disease}
+# hard coded for consistency
+anno_colors <- list(num = c(RColorBrewer::brewer.pal(9, "Set1"), RColorBrewer::brewer.pal(7, "Set2")))
+anno_colors$Disease <- c("Negative control", "Inflammation of unknown origin", "Chronic/recurrent osteitis", "Adult-Onset Still’s Disease", "FMF", "Schnitzler", "Systemic onset juvenile idiopathic arthritis", "Behçet", "Takayasu", "Kawasaki", "Recurrent Pericarditis", "Pyoderma gangrenosum", "HIDS",  "CAPS", "TRAPS", "Sweet syndrome") # as in unique(mergedDataRaw$Disease)
+
+names(anno_colors$num) <- anno_colors$Disease
+anno_colors$Disease <- anno_colors$num
+
+names(anno_colors$num) <- c(1:16)
+
+anno_colors$match <- names(anno_colors$num)
+names(anno_colors$match) <-  names(anno_colors$Disease)
+anno_colors
+
+```
+
+
+```{r general plots - mergedDataRaw}
+df <- mergedDataRaw
+dim(df)
+table(df$Disease)
+table(df$Fever)
+table(df$SampleType) 
+table(df$PlateId)
+table(getAnalyteInfo(df)$Dilution)
+
+
+# png(file = 'output_YL/num_patients.png')
+opar <- par(mar=c(5.1,15.1,4.1,5.1))
+barplot(rev(sort(table(df$Disease))), horiz = TRUE, las = "2", main = paste0("# of Patients (N = ", sum(table(df$Disease)), ")"), cex.names=0.8, xlab = "Frequency")
+# dev.off()
+
+# png(file = 'output_YL/age_patients.png')
+par(opar)
+barplot(table(df$Age, useNA = "always"),
+        main = paste0("Age (N = ", sum(table(df$Age, useNA = "always")), ")"), xlab = "Age [year]", ylab = "Frequency", cex.names =.8)
+# dev.off()
+
+# png(file = 'output_YL/fever_patients.png')
+bp <- barplot(rev(sort(table(df$Fever))), main = paste0("Fever (N = ", sum(table(df$Fever, useNA = "always")), ")"), xlab = "Fever", ylab = "Frequency", cex.names =.8)
+text(bp, 9, rev(sort(table(df$Fever))), cex = .8)
+# dev.off()
+
+
+# png(file = 'output_YL/gender_patients.png')
+bp <- barplot(table(df$Gender), main = paste0("Gender (N = ", sum(table(df$Gender, useNA = "always")), ")"), xlab = "Gender", ylab = "Frequency", cex.names =.8)
+text(bp, 7, table(df$Gender), cex = .8)
+# dev.off()
+
+ggplot(df %>% count(Disease, Clinic_num), aes(fill=Disease, y=n, x=Clinic_num)) +
+    geom_bar(position="stack", stat="identity") +
+    scale_fill_manual(breaks = names(anno_colors$Disease), values = anno_colors$Disease) +
+    ggtitle("Sample Collection (SAID subtype per Clinic)") + ylab('# of Patients')
+# ggsave("output_YL/sample_collection.png")
+
+# png(file = 'output_YL/gender_label.png')
+bp <- barplot(table(df$label), main = paste0("# of labels (N = ", sum(table(df$label, useNA = "always")), ")"), cex.names=0.8, xlab = "Before (A) / After (B) treatments")
+text(bp, 7, table(df$label), cex=1)
+# dev.off()
+```
+
+
+## Outlier removal
+```{r outlier detection}
+meta <- getMeta(mergedDataRaw)
+seqs <- getAnalytes(mergedDataRaw)
+
+# see https://eurekastatistics.com/using-the-median-absolute-deviation-to-find-outliers/
+devMAD <- function(x, cutoff = 0) {
+  medf <- median(x)
+  madf <- mad(x)
+  r <- (x - medf)/madf
+  ## must be checked on numeric with value >= 0
+  if ( cutoff > 0 ) { ## give logical vector back with MAD value
+    r <- abs(r) >= cutoff ## symmetrical 
+  }
+  r
+}
+
+# apply log10, outlier detection criteria 6 MAD 
+# deviationH <- apply(mergedDataRaw[,seqs],2, devMAD) # deviation float
+deviation <- apply(log10(mergedDataRaw[,seqs]), 2, devMAD, cutoff = 6) # deviation boolean
+
+# get percentage of the overlap in outlier analytes across samples
+mat <- crossprod(t(deviation)) # t(x) %*% y            # calculate the overlap
+pct.mat <- floor(t(mat * 100 / diag(mat)))        # calculate the percentage
+
+anno_outlier <- data.frame("Disease" = factor(mergedDataRaw$Disease))
+rownames(anno_outlier) <- rownames(pct.mat)
+# row names --> SampleId
+rownames(anno_outlier) <- mergedDataRaw$SampleId
+rownames(pct.mat) <- mergedDataRaw$SampleId[match(rownames(pct.mat), rownames(mergedDataRaw))]
+colnames(pct.mat) <- mergedDataRaw$SampleId[match(colnames(pct.mat), rownames(mergedDataRaw))]
+
+# low overlap among outliers across samples 
+pheatmap(main="Overlap Percentage of Outlier Analytes (6 MAD)", 
+         # filename = 'output_YL/outlier_overlap.png',
+         pct.mat, 
+         cluster_rows=FALSE, cluster_cols=FALSE,
+         annotation_row = anno_outlier, annotation_col = anno_outlier, 
+         annotation_colors = anno_colors, fontsize = 3)
+
+df <- mergedDataRaw
+df$outlier_rowsum <- apply(deviation, 1, sum)
+# df$outlier_rowsumH <- apply(apply(deviationH, 2, function(x) {x>=6 | x <=-6}), 1, sum) 
+
+cat("The total number of outliers that deviate more than 6 MAD: ", sum(df$outlier_rowsum), '\n')
+
+# number of outlier analytes across samples 
+ggplot(df, aes(fill=Disease, y=outlier_rowsum, x=reorder(SampleId, outlier_rowsum))) +
+    geom_bar(position="stack", stat="identity") +
+    scale_fill_manual(breaks = names(anno_colors$Disease), values = anno_colors$Disease) +
+    ggtitle("Number of outlier analytes across samples (6MAD)") + ylab('# of outliers') + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), text = element_text(size = 8), axis.text = element_text(size = 4), legend.position = "none")
+
+# ggsave("output_YL/outlier_count.png")
+```
+
+```{r detected outlier samples }
+# detected outlier samples
+df2 <- df %>% filter(outlier_rowsum >= 50)
+
+# labels of the detected samples
+# png(filename = 'output_YL/outlier_label.png')
+bp <- barplot(table(df2$label), main = paste0("Samples with >= 50 of outliers (6MAD) : # of labels (N = ", sum(table(df2$label)), ")"), cex.names=0.8, xlab = "Before (A) / After (B) treatments")
+text(bp, 3, table(df2$label), cex=1)
+# dev.off()
+
+# which clinical centers are the outliers coming from?
+# table(x$Clinic_num[x$outlier_rowsum >= 50])
+ggplot(df2 %>% count(Disease, Clinic_num), aes(fill=Disease, y=n, x=Clinic_num)) +
+     geom_bar(position="stack", stat="identity") +
+     scale_fill_manual(breaks = names(anno_colors$Disease), values = anno_colors$Disease) +
+     ggtitle("Samples with >= 50 of outliers (6MAD) : SAID subtype per clinic") + ylab('# of Patients') + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), text = element_text(size = 8))
+# ggsave("output_YL/outlier_clinic.png")
+```
+
+
+```{r outlier removal }
+mergedDataRaw <- mergedDataRaw %>% .[df$outlier_rowsum < 50,] 
+dim(mergedDataRaw)
+```
+
+
+## Data prepration - mergedDataRaw, cleanData0, cleanData1, cleanData2
+
+```{r cleanData0 - log 10 transformation}
+is_seq <- function(.x) grepl("^seq\\.[0-9]{4}", .x) # regex for analytes 
+
+cleanData0 <- mergedDataRaw %>%  
+  mutate_if(is_seq(names(.)), ~ {   # mutate analytes only
+    log10(.x)                 # log 10 transformation
+  })
+# cleanData0
+```
+
+
+```{r cleanData1 - log 10 transform, disease group reference normalization}
+cleanData1 <- mergedDataRaw %>%  
+  mutate_if(is_seq(names(.)), ~ {   # mutate analytes only
+    x1 <- log10(.x)                 # log 10 transformation
+    out <- x1 - mean(x1)            # center analytes
+    out / sd(out)                   # scale analytes
+  })
+
+# cleanData1
+```
+
+```{r cleanData2 - log 10 transformation, healthy control reference normalization}
+# log transform before getting healthy mean, sd
+cleanData2 <- mergedDataRaw %>%  
+  mutate_if(is_seq(names(.)), ~ {   
+    log10(.x)})
+
+# get healthy mean, sd
+group.mean <- list()
+group.median <- list()
+group.sd <- list()
+for (i in unique(cleanData2$Disease)) {
+  gr_mean <- mean(as.matrix(cleanData2[cleanData2$Disease == i,seqs]))
+  group.mean[[i]] <- cbind(Disease = i, Group_mean = gr_mean)
+  
+  gr_median <- median(as.matrix(cleanData2[cleanData2$Disease == i,seqs]))
+  group.median[[i]]  <- cbind(Disease = i, Group_median = gr_median)
+  
+  gr_sd <- sd(as.matrix(cleanData2[cleanData2$Disease == i,seqs]))
+  group.sd[[i]] <- cbind(Disease = i, Group_sd = gr_sd)
+}
+
+group.mean <- data.frame(do.call(rbind,group.mean))
+group.median <- data.frame(do.call(rbind,group.median))
+group.sd <- data.frame(do.call(rbind,group.sd)) 
+
+healthy.mean <- as.numeric(group.mean[group.mean$Disease == 'Negative control',]$Group_mean)
+healthy.sd <- as.numeric(group.sd[group.sd$Disease == 'Negative control',]$Group_sd)
+
+cleanData2 <- mergedDataRaw %>%  
+  mutate_if(is_seq(names(.)), ~ {   # mutate analytes only
+    x1 <- log10(.x)                 # log 10 transformation
+    out <- x1 - healthy.mean            # center analytes
+    out / healthy.sd                   # scale analytes
+  })
+
+# cleanData2 
+```
+
+```{r disease group mean, median, sd}
+group <- group.mean
+group$Group_median <- group.median$Group_median
+group$Group_sd <- group.sd$Group_sd
+group[,2:4] <- sapply(group[,2:4], FUN = function(x) {round(as.numeric(x), digits = 2)})
+group
+```
+
+```{r density plot}
+## density plot
+plot(density(as.numeric(mergedDataRaw[,32])))
+plot(density(as.numeric(cleanData0[,32]))) # easier to compare with other datasets as it is in the similar range
+plot(density(as.numeric(cleanData1[,32])))
+plot(density(as.numeric(cleanData2[,32])))
+
+```
+
+
+## Select only A (pre-treatment) & save the datasets for further analysis 
+```{r select only A (pre-treatment)}
+mergedDataRaw <- mergedDataRaw %>% .[grep("A|[0-9]$", .$SampleId),]
+cleanData0 <- cleanData0 %>% .[grep("A|[0-9]$", .$SampleId),]
+cleanData1 <- cleanData1 %>% .[grep("A|[0-9]$", .$SampleId),]
+cleanData2 <- cleanData2 %>% .[grep("A|[0-9]$", .$SampleId),]
+
+table(cleanData2$label)
+```
+
+```{r save RDS}
+saveRDS(mergedDataRaw, file = "output_YL/mergedDataRaw.rds")
+saveRDS(cleanData0, file = "output_YL/cleanData0.rds")
+saveRDS(cleanData1, file = "output_YL/cleanData1.rds")
+saveRDS(cleanData2, file = "output_YL/cleanData2.rds")
+```
+
+
+```{r general plots - mergedDataRaw - after outlier removal, selecting label A}
+df <- mergedDataRaw
+dim(df)
+sum(table(df$Disease))
+table(df$Fever)
+table(df$SampleType) 
+table(df$PlateId)
+table(getAnalyteInfo(df)$Dilution)
+
+opar <- par(mar=c(5.1,15.1,4.1,5.1))
+barplot(rev(sort(table(df$Disease))), horiz = TRUE, las = "2", main = paste0("# of Patients (N = ", sum(table(df$Disease)), ")"), cex.names=0.8, xlab = "Frequency")
+
+par(opar)
+barplot(table(df$Age, useNA = "always"),
+        main = paste0("Age (N = ", sum(table(df$Age, useNA = "always")), ")"), xlab = "Age [year]", ylab = "Frequency", cex.names =.8)
+
+bp <- barplot(rev(sort(table(df$Fever))), main = paste0("Fever (N = ", sum(table(df$Fever, useNA = "always")), ")"), xlab = "Fever", ylab = "Frequency", cex.names =.8)
+text(bp, 9, rev(sort(table(df$Fever))), cex = .8)
+
+bp <- barplot(table(df$Gender), main = paste0("Gender (N = ", sum(table(df$Gender, useNA = "always")), ")"), xlab = "Gender", ylab = "Frequency", cex.names =.8)
+text(bp, 7, table(df$Gender), cex = .8)
+
+bp <- barplot(table(df$label), main = paste0("# of labels (N = ", sum(table(df$label, useNA = "always")), ")"), cex.names=0.8, xlab = "Before (A) / After (B) treatments")
+text(bp, 7, table(df$label), cex=1)
+
+ggplot(df %>% count(Disease, Clinic_num), aes(fill=Disease, y=n, x=Clinic_num)) +
+    geom_bar(position="stack", stat="identity") +
+    scale_fill_manual(breaks = names(anno_colors$Disease), values = anno_colors$Disease) +
+    ggtitle("Sample Collection (SAID subtype per Clinic)") + ylab('# of Patients') + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), text = element_text(size = 8))
+# ggsave("output_YL/sample_collection_2.png")
+```
+
+## Global clustering (all proteins) - no distinctive cluster
+### Clustering of 4 datasets with all phenotypes
+
+```{r data prep for clustering}
+x.mergedDataRaw <- mergedDataRaw %>% dplyr::select(SampleId, Disease, RowCheck, contains('seq.')) 
+x.cleanData0 <- cleanData0 %>% dplyr::select(SampleId, Disease, RowCheck, contains('seq.')) 
+x.cleanData1 <- cleanData1 %>% dplyr::select(SampleId, Disease, RowCheck, contains('seq.')) 
+x.cleanData2 <- cleanData2 %>% dplyr::select(SampleId, Disease, RowCheck, contains('seq.'))
+```
+
+
+```{r quick_clustering - mergedDataRaw - all phenotypes - all proteins}
+
+# Distance Matrix
+# "euclidean", "maximum", "manhattan", "canberra", "binary" or "minkowski"
+sampleDists <- dist(as.matrix(x.mergedDataRaw[,-1:-3]), method = "euclidean") 
+sampleDistMatrix <- as.matrix( sampleDists )
+
+anno <- data.frame("Disease"=factor(x.mergedDataRaw$Disease))
+anno$Disease <- relevel(anno$Disease, ref = "Negative control")
+rownames(anno) <- colnames(sampleDistMatrix)
+colnames(anno) <- "Disease"
+rownames(sampleDistMatrix) <- rownames(x.mergedDataRaw)
+
+pheatmap(sampleDistMatrix,
+         scale = "row",
+         # filename = 'output_YL/global_mergedDataRaw_distance.png', 
+         main = "Euclidean distance matrix (mergedDataRaw)",
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         show_colnames = FALSE, show_rownames = FALSE,
+         annotation_col = anno, annotation_row = anno,
+         annotation_colors = anno_colors, 
+         border_color=FALSE, annotation_legend = FALSE)
+
+# Pairwise correlation between samples (columns)
+sample.cor <- cor(t(x.mergedDataRaw[,-1:-3]), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor,
+         # filename = 'output_YL/global_mergedDataRaw_correlation.png',
+         main = "Pearson correlation data (mergedDataRaw)",
+         clustering_distance_cols = as.dist(1 - sample.cor),
+         clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = FALSE, show_rownames = FALSE,
+         annotation_col = anno, annotation_row = anno,
+         annotation_colors = anno_colors, 
+         border_color=FALSE, annotation_legend = FALSE)
+```
+
+```{r quick_clustering - cleanData0 - all phenotypes - all proteins}
+
+
+# Distance Matrix
+# "euclidean", "maximum", "manhattan", "canberra", "binary" or "minkowski"
+sampleDists <- dist(as.matrix(x.cleanData0[,-1:-3]), method = "euclidean") 
+sampleDistMatrix <- as.matrix( sampleDists )
+
+anno <- data.frame("Disease"=factor(x.cleanData0$Disease))
+anno$Disease <- relevel(anno$Disease, ref = "Negative control")
+rownames(anno) <- colnames(sampleDistMatrix)
+colnames(anno) <- "Disease"
+rownames(sampleDistMatrix) <- rownames(x.cleanData0)
+
+pheatmap(sampleDistMatrix,
+         scale = "row",
+         # filename = 'output_YL/global_cleanData0_distance.png',
+         main = "Euclidean distance matrix (cleanData0)",
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         show_colnames = FALSE, show_rownames = FALSE,
+         annotation_col = anno, annotation_row = anno,
+         annotation_colors = anno_colors, 
+         border_color=FALSE, annotation_legend = FALSE)
+
+# Pairwise correlation between samples (columns)
+sample.cor0 <- cor(t(x.cleanData0[,-1:-3]), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor0,
+         # filename = 'output_YL/global_cleanData0_correlation.png',
+         main = "Pearson correlation data (cleanData0)",
+         clustering_distance_cols = as.dist(1 - sample.cor0),
+         clustering_distance_rows = as.dist(1 - sample.cor0),
+         show_colnames = FALSE, show_rownames = FALSE,
+         annotation_col = anno, annotation_row = anno,
+         annotation_colors = anno_colors, 
+         border_color=FALSE, annotation_legend = FALSE)
+```
+
+```{r quick_clustering - cleanData1 - all phenotypes - all proteins}
+
+# Distance Matrix
+sampleDists1 <- dist(as.matrix(x.cleanData1[,-1:-3]), method = "euclidean") 
+sampleDistMatrix1 <- as.matrix( sampleDists1 )
+
+anno <- data.frame("Disease"=factor(x.cleanData1$Disease))
+anno$Disease <- relevel(anno$Disease, ref = "Negative control")
+rownames(anno) <- colnames(sampleDistMatrix1)
+colnames(anno) <- "Disease"
+rownames(sampleDistMatrix1) <- rownames(x.cleanData1) ## NULL?
+
+pheatmap(sampleDistMatrix1,
+         scale = "row",
+         # filename = 'output_YL/global_cleanData1_distance.png',
+         main = "Euclidean distance matrix (cleanData1)",
+         clustering_distance_rows = sampleDists1,
+         clustering_distance_cols = sampleDists1,
+         show_colnames = FALSE, show_rownames = FALSE,
+         annotation_col = anno, annotation_row = anno,
+         annotation_colors = anno_colors, 
+         border_color=FALSE, annotation_legend = FALSE)
+
+# Pairwise correlation between samples (columns)
+sample.cor1 <- cor(t(x.cleanData1[,-1:-3]), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor1,
+         # filename = 'output_YL/global_cleanData1_correlation.png',
+         main = "Pearson correlation data (cleanData1)",
+         clustering_distance_cols = as.dist(1 - sample.cor1),
+         clustering_distance_rows = as.dist(1 - sample.cor1),
+         show_colnames = FALSE, show_rownames = FALSE,
+         annotation_col = anno, annotation_row = anno,
+         annotation_colors = anno_colors, 
+         border_color=FALSE, annotation_legend = FALSE)
+```
+
+```{r quick_clustering - cleanData2 - all phenotypes - all proteins}
+
+# Distance Matrix
+sampleDists2 <- dist(as.matrix(x.cleanData2[,-1:-3]), method = "euclidean") 
+sampleDistMatrix2 <- as.matrix( sampleDists2 )
+
+anno <- data.frame("Disease"=factor(x.cleanData2$Disease))
+anno$Disease <- relevel(anno$Disease, ref = "Negative control")
+rownames(anno) <- colnames(sampleDistMatrix2)
+colnames(anno) <- "Disease"
+rownames(sampleDistMatrix2) <- rownames(x.cleanData2)
+
+pheatmap(sampleDistMatrix2,
+         scale = "row",
+         # filename = 'output_YL/global_cleanData2_distance.png',
+         main = "Euclidean distance matrix (cleanData2)",
+         clustering_distance_rows = sampleDists2,
+         clustering_distance_cols = sampleDists2,
+         show_colnames = FALSE, show_rownames = FALSE,
+         annotation_col = anno, annotation_row = anno,
+         annotation_colors = anno_colors, 
+         border_color=FALSE, annotation_legend = FALSE)
+
+# Pairwise correlation between samples (columns)
+sample.cor2 <- cor(t(x.cleanData2[,-1:-3]), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor2,
+  # filename = 'output_YL/global_cleanData2_correlation.png',
+  main = "Pearson correlation data (cleanData2)",
+  clustering_distance_cols = as.dist(1 - sample.cor2),
+  clustering_distance_rows = as.dist(1 - sample.cor2),
+         show_colnames = FALSE, show_rownames = FALSE,
+         annotation_col = anno, annotation_row = anno,
+         annotation_colors = anno_colors, 
+         border_color=FALSE, annotation_legend = FALSE)
+
+```
+
+
+## local clustering (few phenotypes, all proteins) - still does not cluster
+### Hierarchical/ Pearson Correlation of 3 datasets focusing on FMF and Negative Control
+
+```{r data prep}
+focus <- c('Negative control', 'FMF')
+focus.x.mergedDataRaw <- x.mergedDataRaw[x.mergedDataRaw$Disease %in% focus,]
+focus.x.cleanData0 <- x.cleanData0[x.cleanData0$Disease %in% focus,]
+focus.x.cleanData1 <- x.cleanData1[x.cleanData1$Disease %in% focus,]
+focus.x.cleanData2 <- x.cleanData2[x.cleanData2$Disease %in% focus,]
+
+rownames(focus.x.mergedDataRaw) <- focus.x.mergedDataRaw$SampleId
+rownames(focus.x.cleanData0) <- focus.x.cleanData0$SampleId
+rownames(focus.x.cleanData1) <- focus.x.cleanData1$SampleId
+rownames(focus.x.cleanData2) <- focus.x.cleanData2$SampleId
+
+focus.anno_colors <- anno_colors
+focus.anno_colors$Disease <- anno_colors$Disease[names(anno_colors$Disease) %in% focus] 
+focus.anno_colors$num <- anno_colors$num[names(anno_colors$Disease) %in% focus]
+focus.anno_colors$match <- anno_colors$match[names(anno_colors$Disease) %in% focus]
+focus.anno_colors
+```
+
+
+
+```{r quick_clustering - mergedDataRaw - focus}
+
+focus.X <- focus.x.mergedDataRaw[,-1:-3]
+focus.Y <- focus.x.mergedDataRaw$Disease
+
+# Euclidean distance, Complete linkage
+euc.dist <-  dist(focus.X, method = 'euclidean')
+hc <- hclust(euc.dist, method = 'complete')
+as.dendrogram(hc) %>%
+  plot(horiz = TRUE)
+
+clusterCut.mergedData <- cutree(hc, 2)
+
+
+cluster_col<- data.frame(Cluster = clusterCut.mergedData)
+cluster_col$Cluster <- paste0('Cluster ', cluster_col$Cluster)
+disease_col <- data.frame(Disease = focus.Y)
+row.names(disease_col) <- rownames(cluster_col)
+
+pheatmap(as.matrix(euc.dist),
+         scale = "row",
+         # filename = 'output_YL/focus11_mergedDataRaw_distance.png', 
+         main = "Euclidean distance matrix (mergedDataRaw_focus)",
+         clustering_distance_rows = euc.dist,
+         clustering_distance_cols = euc.dist,
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+
+# Pairwise correlation between samples (columns)
+sample.cor <- cor(t(focus.X), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor,
+  # filename = 'output_YL/focus1_mergedDataRaw_correlation.png',
+  main = "Pearson correlation data (mergedDataRaw_focus)",
+  clustering_distance_cols = as.dist(1 - sample.cor),
+  clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+```
+
+```{r quick_clustering - mergedData - focus}
+
+focus.X <- focus.x.cleanData0[,-1:-3]
+focus.Y <- focus.x.cleanData0$Disease
+
+# Euclidean distance, Complete linkage
+euc.dist <-  dist(focus.X, method = 'euclidean')
+hc <- hclust(euc.dist, method = 'complete')
+as.dendrogram(hc) %>%
+  plot(horiz = TRUE)
+
+clusterCut.mergedData <- cutree(hc, 2)
+
+
+cluster_col<- data.frame(Cluster = clusterCut.mergedData)
+cluster_col$Cluster <- paste0('Cluster ', cluster_col$Cluster)
+disease_col <- data.frame(Disease = focus.Y)
+row.names(disease_col) <- rownames(cluster_col)
+
+pheatmap(as.matrix(euc.dist),
+         scale = "row",
+         # filename = 'output_YL/focus1_cleanData0_distance.png',
+         main = "Euclidean distance matrix (cleanData0_focus)",
+         clustering_distance_rows = euc.dist,
+         clustering_distance_cols = euc.dist,
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+
+# Pairwise correlation between samples (columns)
+sample.cor <- cor(t(focus.X), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor,
+  # filename = 'output_YL/focus1_cleanData0_correlation.png',
+  main = "Pearson correlation data (cleanData0_focus)",
+  clustering_distance_cols = as.dist(1 - sample.cor),
+  clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+```
+
+```{r quick_clustering - cleanData1 - focus}
+
+focus.X <- focus.x.cleanData1[,-1:-3]
+focus.Y <- focus.x.cleanData1$Disease
+
+# Euclidean distance, Complete linkage
+euc.dist <-  dist(focus.X, method = 'euclidean')
+hc <- hclust(euc.dist, method = 'complete')
+as.dendrogram(hc) %>%
+  plot(horiz = TRUE)
+
+clusterCut.mergedData <- cutree(hc, 2)
+
+
+cluster_col<- data.frame(Cluster = clusterCut.mergedData)
+cluster_col$Cluster <- paste0('Cluster ', cluster_col$Cluster)
+disease_col <- data.frame(Disease = focus.Y)
+row.names(disease_col) <- rownames(cluster_col)
+
+pheatmap(as.matrix(euc.dist),
+         scale = "row",
+         # filename = 'output_YL/focus1_cleanData1_distance.png',
+         main = "Euclidean distance matrix (cleanData1_focus)",
+         clustering_distance_rows = euc.dist,
+         clustering_distance_cols = euc.dist,
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+
+# Pairwise correlation between samples (columns)
+sample.cor <- cor(t(focus.X), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor,
+  # filename = 'output_YL/focus1_cleanData1_correlation.png',
+  main = "Pearson correlation data (cleanData1_focus)",
+  clustering_distance_cols = as.dist(1 - sample.cor),
+  clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+```
+
+```{r quick_clustering - cleanData2 - focus}
+
+focus.X <- focus.x.cleanData2[,-1:-3]
+focus.Y <- focus.x.cleanData2$Disease
+
+# Euclidean distance, Complete linkage
+euc.dist <-  dist(focus.X, method = 'euclidean')
+hc <- hclust(euc.dist, method = 'complete')
+as.dendrogram(hc) %>%
+  plot(horiz = TRUE)
+
+clusterCut.mergedData <- cutree(hc, 2)
+
+# plot the heatmap
+cluster_col<- data.frame(Cluster = clusterCut.mergedData)
+cluster_col$Cluster <- paste0('Cluster ', cluster_col$Cluster)
+disease_col <- data.frame(Disease = focus.Y)
+row.names(disease_col) <- rownames(cluster_col)
+
+pheatmap(as.matrix(euc.dist),
+         scale = "row",
+         # filename = 'output_YL/focus1_cleanData2_distance.png',
+         main = "Euclidean distance matrix (cleanData2_focus)",
+         clustering_distance_rows = euc.dist,
+         clustering_distance_cols = euc.dist,
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+
+
+# Pairwise correlation between samples
+sample.cor <- cor(t(focus.X), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor,
+  # filename = 'output_YL/focus1_cleanData2_correlation.png',
+  main = "Pearson correlation data (cleanData2_focus)",
+  clustering_distance_cols = as.dist(1 - sample.cor),
+  clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+
+```
+
+### PCA of 3 datasets focusing on FMF and Negative Control
+
+```{r PCA - focus 1}
+
+pca.focus.x.mergedDataRaw <- prcomp(focus.x.mergedDataRaw[,-1:-3], center=FALSE, scale.=FALSE, retx=TRUE)
+# summary(pca.focus.x.mergedDataRaw)
+
+eigen.value <- pca.focus.x.mergedDataRaw$sdev^2
+var_explained <- eigen.value / sum(eigen.value)
+plot(var_explained, type = 'o', xlab = 'Principle Component (PC)', ylab = 'Variance Explained')
+
+pca.focus.x.mergedDataRaw$x %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.mergedDataRaw$Disease[match(rownames(focus.x.mergedDataRaw), rownames(pca.focus.x.mergedDataRaw$x))]) %>%
+  ggplot(aes(x=PC1,y=PC2)) + geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  # theme_bw(base_size=32) + 
+  labs(x=paste0("PC1: ",round(var_explained[1]*100,1),"%"),
+       y=paste0("PC2: ",round(var_explained[2]*100,1),"%")) +
+  theme(legend.position="top", legend.text = element_text(size=10), text = element_text(size = 20), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.mergedDataRaw), segment.color = 'grey50')
+
+# ggsave('output_YL/focus1_mergedDataRaw_pca.png')
+#######################
+
+pca.focus.x.cleanData0 <- prcomp(focus.x.cleanData0[,-1:-3], center=FALSE, scale.=FALSE, retx=TRUE)
+# summary(pca.focus.x.cleanData0)
+
+eigen.value <- pca.focus.x.cleanData0$sdev^2
+var_explained <- eigen.value / sum(eigen.value)
+plot(var_explained, type = 'o', xlab = 'Principle Component (PC)', ylab = 'Variance Explained')
+
+pca.focus.x.cleanData0$x %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData0$Disease[match(rownames(focus.x.cleanData0), rownames(pca.focus.x.cleanData0$x))]) %>%
+  ggplot(aes(x=PC1,y=PC2)) + geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  # theme_bw(base_size=32) + 
+  labs(x=paste0("PC1: ",round(var_explained[1]*100,1),"%"),
+       y=paste0("PC2: ",round(var_explained[2]*100,1),"%")) +
+  theme(legend.position="top", legend.text = element_text(size=10), text = element_text(size = 20), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData0), segment.color = 'grey50')
+
+
+# ggsave('output_YL/focus1_cleanData0_pca.png')
+
+###########################
+
+
+pca.focus.x.cleanData1 <- prcomp(focus.x.cleanData1[,-1:-3], center=FALSE, scale.=FALSE, retx=TRUE)
+# summary(pca.focus.x.cleanData1)
+
+eigen.value <- pca.focus.x.cleanData1$sdev^2
+var_explained <- eigen.value / sum(eigen.value)
+plot(var_explained, type = 'o', xlab = 'Principle Component (PC)', ylab = 'Variance Explained')
+
+pca.focus.x.cleanData1$x %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData1$Disease[match(rownames(focus.x.cleanData1), rownames(pca.focus.x.cleanData1$x))]) %>%
+  ggplot(aes(x=PC1,y=PC2)) + geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  # theme_bw(base_size=32) + 
+  labs(x=paste0("PC1: ",round(var_explained[1]*100,1),"%"),
+       y=paste0("PC2: ",round(var_explained[2]*100,1),"%")) +
+  theme(legend.position="top", legend.text = element_text(size=10), text = element_text(size = 20), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData1), segment.color = 'grey50')
+
+# ggsave('output_YL/focus1_cleanData1_pca.png')
+
+###########################
+
+pca.focus.x.cleanData2 <- prcomp(focus.x.cleanData2[,-1:-3], center=FALSE, scale.=FALSE, retx=TRUE)
+# summary(pca.focus.x.cleanData2)
+
+eigen.value <- pca.focus.x.cleanData2$sdev^2
+var_explained <- eigen.value / sum(eigen.value)
+plot(var_explained, type = 'o', xlab = 'Principle Component (PC)', ylab = 'Variance Explained')
+
+pca.focus.x.cleanData2$x %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData2$Disease[match(rownames(focus.x.cleanData2), rownames(pca.focus.x.cleanData2$x))]) %>%
+  ggplot(aes(x=PC1,y=PC2)) + geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  labs(x=paste0("PC1: ",round(var_explained[1]*100,1),"%"),
+       y=paste0("PC2: ",round(var_explained[2]*100,1),"%")) +
+  theme(legend.position="top", legend.text = element_text(size=10), text = element_text(size = 20), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData2), segment.color = 'grey50')
+
+# ggsave('output_YL/focus1_cleanData2_pca.png')
+
+```
+
+### TSNE of 3 datasets focusing on FMF and Negative Control
+
+```{r max perplexity}
+(nrow(focus.x.cleanData1) - 1) / 3
+```
+
+
+```{r TSNE - focus 1} 
+
+tsne.focus.x.mergedDataRaw <- focus.x.mergedDataRaw %>% select(where(is.numeric)) %>%
+  Rtsne(normalize = FALSE, initial_dims = 5, perplexity = 6, max_iter = 5000) 
+
+tsne.focus.x.mergedDataRaw$Y %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.mergedDataRaw$Disease) %>% 
+  rename(tSNE1="V1", tSNE2="V2") %>%
+  ggplot(aes(x = tSNE1, y = tSNE2)) +
+  geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  theme(legend.position="top", legend.text = element_text(size=8), text = element_text(size = 15), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.mergedDataRaw), segment.color = 'grey50')
+
+# ggsave('output_YL/focus1_mergedDataRaw_tsne.png')
+
+#######################
+
+tsne.focus.x.cleanData0 <- focus.x.cleanData0 %>% select(where(is.numeric)) %>%
+  Rtsne(normalize = FALSE, initial_dims = 5, perplexity = 6, max_iter = 5000) 
+
+tsne.focus.x.cleanData0$Y %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData0$Disease) %>% 
+  rename(tSNE1="V1", tSNE2="V2") %>%
+  ggplot(aes(x = tSNE1, y = tSNE2)) +
+  geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  theme(legend.position="top", legend.text = element_text(size=8), text = element_text(size = 15), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData0), segment.color = 'grey50')
+
+# ggsave('output_YL/focus1_cleanData0_tsne.png')
+
+#######################
+
+tsne.focus.x.cleanData1 <- focus.x.cleanData1 %>% select(where(is.numeric)) %>%
+  Rtsne(normalize = FALSE, initial_dims = 5, perplexity = 6, max_iter = 5000) 
+
+tsne.focus.x.cleanData1$Y %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData1$Disease) %>% 
+  rename(tSNE1="V1", tSNE2="V2") %>%
+  ggplot(aes(x = tSNE1, y = tSNE2)) +
+  geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  theme(legend.position="top", legend.text = element_text(size=8), text = element_text(size = 15), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData1), segment.color = 'grey50')
+
+# ggsave('output_YL/focus1_cleanData1_tsne.png')
+
+#####################
+
+tsne.focus.x.cleanData2 <- focus.x.cleanData2 %>% select(where(is.numeric)) %>%
+  Rtsne(normalize = FALSE, initial_dims = 5, perplexity = 6, max_iter = 5000) 
+
+tsne.focus.x.cleanData2$Y %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData2$Disease) %>% 
+  rename(tSNE1="V1", tSNE2="V2") %>%
+  ggplot(aes(x = tSNE1, y = tSNE2)) +
+  geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  theme(legend.position="top", legend.text = element_text(size=8), text = element_text(size = 15), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData2), segment.color = 'grey50')
+
+# ggsave('output_YL/focus1_cleanData2_tsne.png')
+```
+
+
+### Clustering - AOSD
+### Hierarchical/ Pearson Correlation of 3 datasets focusing on AOSD and Negative Control
+
+```{r}
+focus <- c('Negative control', "Adult-Onset Still’s Disease") 
+
+focus.x.mergedDataRaw <- x.mergedDataRaw[x.mergedDataRaw$Disease %in% focus,]
+focus.x.cleanData0 <- x.cleanData0[x.cleanData0$Disease %in% focus,]
+focus.x.cleanData1 <- x.cleanData1[x.cleanData1$Disease %in% focus,]
+focus.x.cleanData2 <- x.cleanData2[x.cleanData2$Disease %in% focus,]
+
+rownames(focus.x.mergedDataRaw) <- focus.x.mergedDataRaw$SampleId
+rownames(focus.x.cleanData0) <- focus.x.cleanData0$SampleId
+rownames(focus.x.cleanData1) <- focus.x.cleanData1$SampleId
+rownames(focus.x.cleanData2) <- focus.x.cleanData2$SampleId
+
+
+focus.anno_colors <- anno_colors
+focus.anno_colors$Disease <- anno_colors$Disease[names(anno_colors$Disease) %in% focus] 
+focus.anno_colors$num <- anno_colors$num[names(anno_colors$Disease) %in% focus]
+focus.anno_colors$match <- anno_colors$match[names(anno_colors$Disease) %in% focus]
+focus.anno_colors
+```
+
+```{r quick_clustering2 - mergedDataRaw - focus2}
+
+focus.X <- focus.x.mergedDataRaw[,-1:-3]
+focus.Y <- focus.x.mergedDataRaw$Disease
+
+# Euclidean distance, Complete linkage
+euc.dist <-  dist(focus.X, method = 'euclidean')
+hc <- hclust(euc.dist, method = 'complete')
+as.dendrogram(hc) %>%
+  plot(horiz = TRUE)
+
+clusterCut.mergedData <- cutree(hc, 2)
+
+
+cluster_col<- data.frame(Cluster = clusterCut.mergedData)
+cluster_col$Cluster <- paste0('Cluster ', cluster_col$Cluster)
+disease_col <- data.frame(Disease = focus.Y)
+row.names(disease_col) <- rownames(cluster_col)
+
+pheatmap(as.matrix(euc.dist),
+         # filename = 'output_YL/focus2_mergedDataRaw_distance.png',
+         scale = "row",
+         main = "Euclidean distance (mergedDataRaw_focus2)",
+         clustering_distance_rows = euc.dist,
+         clustering_distance_cols = euc.dist,
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+
+# Pairwise correlation between samples (columns)
+sample.cor <- cor(t(focus.X), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor,
+         # filename = 'output_YL/focus2_mergedDataRaw_correlation.png',
+         main = "Pearson correlation (mergedDataRaw_focus2)",
+  clustering_distance_cols = as.dist(1 - sample.cor),
+  clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+```
+
+
+```{r quick_clustering2 - cleanData0 - focus2}
+
+focus.X <- focus.x.cleanData0[,-1:-3]
+focus.Y <- focus.x.cleanData0$Disease
+
+# Euclidean distance, Complete linkage
+euc.dist <-  dist(focus.X, method = 'euclidean')
+hc <- hclust(euc.dist, method = 'complete')
+as.dendrogram(hc) %>%
+  plot(horiz = TRUE)
+
+clusterCut.cleanData0 <- cutree(hc, 2)
+
+
+cluster_col<- data.frame(Cluster = clusterCut.cleanData0)
+cluster_col$Cluster <- paste0('Cluster ', cluster_col$Cluster)
+disease_col <- data.frame(Disease = focus.Y)
+row.names(disease_col) <- rownames(cluster_col)
+
+pheatmap(as.matrix(euc.dist),
+         scale = "row",
+         # filename = 'output_YL/focus2_cleanData0_distance.png',
+         main = "Euclidean distance (cleanData0_focus2)",
+         clustering_distance_rows = euc.dist,
+         clustering_distance_cols = euc.dist,
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+
+# Pairwise correlation between samples (columns)
+sample.cor <- cor(t(focus.X), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor,
+         # filename = 'output_YL/focus2_cleanData0_correlation.png',
+         main = "Pearson correlation (cleanData0_focus2)",
+  clustering_distance_cols = as.dist(1 - sample.cor),
+  clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+```
+
+```{r quick_clustering2 - cleanData1 - focus2}
+
+focus.X <- focus.x.cleanData1[,-1:-3]
+focus.Y <- focus.x.cleanData1$Disease
+
+# Euclidean distance, Complete linkage
+euc.dist <-  dist(focus.X, method = 'euclidean')
+hc <- hclust(euc.dist, method = 'complete')
+as.dendrogram(hc) %>%
+  plot(horiz = TRUE)
+
+clusterCut.mergedData <- cutree(hc, 2)
+
+
+cluster_col<- data.frame(Cluster = clusterCut.mergedData)
+cluster_col$Cluster <- paste0('Cluster ', cluster_col$Cluster)
+disease_col <- data.frame(Disease = focus.Y)
+row.names(disease_col) <- rownames(cluster_col)
+
+pheatmap(as.matrix(euc.dist),
+         scale = "row",
+         # filename = 'output_YL/focus2_cleanData1_distance.png',
+         main = "Euclidean distance (cleanData1_focus2)",
+         clustering_distance_rows = euc.dist,
+         clustering_distance_cols = euc.dist,
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+
+# Pairwise correlation between samples (columns)
+sample.cor <- cor(t(focus.X), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor,
+         # filename = 'output_YL/focus2_cleanData1_correlation.png',
+         main = "Pearson correlation (cleanData1_focus2)",
+  clustering_distance_cols = as.dist(1 - sample.cor),
+  clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+```
+
+
+```{r quick_clustering2 - cleanData2 - focus2}
+
+focus.X <- focus.x.cleanData2[,-1:-3]
+focus.Y <- focus.x.cleanData2$Disease
+
+# Euclidean distance, Complete linkage
+euc.dist <-  dist(focus.X, method = 'euclidean')
+hc <- hclust(euc.dist, method = 'complete')
+as.dendrogram(hc) %>%
+  plot(horiz = TRUE)
+
+clusterCut.mergedData <- cutree(hc, 2)
+
+# plot the heatmap
+cluster_col<- data.frame(Cluster = clusterCut.mergedData)
+cluster_col$Cluster <- paste0('Cluster ', cluster_col$Cluster)
+disease_col <- data.frame(Disease = focus.Y)
+row.names(disease_col) <- rownames(cluster_col)
+
+pheatmap(as.matrix(euc.dist),
+         scale = "row",
+         filename = 'output_YL/focus2_cleanData2_distance.png',
+         main = "Euclidean distance (cleanData2_focus2)",
+         clustering_distance_rows = euc.dist,
+         clustering_distance_cols = euc.dist,
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+
+
+# Pairwise correlation between samples
+sample.cor <- cor(t(focus.X), use = "pairwise.complete.obs", method = "pearson")
+
+# Plot the heatmap
+pheatmap(sample.cor,
+         filename = 'output_YL/focus2_cleanData2_correlation.png',
+         main = "Pearson correlation (cleanData2_focus2)",
+  clustering_distance_cols = as.dist(1 - sample.cor),
+  clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE, 
+         annotation_col =  disease_col, annotation_row = cluster_col,
+         border_color=FALSE, annotation_colors = focus.anno_colors, fontsize = 8
+        )
+
+
+```
+
+### PCA of 4 datasets focusing on AOSD and Negative Control
+
+```{r PCA - focus2}
+
+pca.focus.x.mergedDataRaw <- prcomp(focus.x.mergedDataRaw[,-1:-3], center=FALSE, scale.=FALSE, retx=TRUE)
+# summary(pca.focus.x.mergedDataRaw)
+
+eigen.value <- pca.focus.x.mergedDataRaw$sdev^2
+var_explained <- eigen.value / sum(eigen.value)
+plot(var_explained, type = 'o', xlab = 'Principle Component (PC)', ylab = 'Variance Explained')
+
+pca.focus.x.mergedDataRaw$x %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.mergedDataRaw$Disease[match(rownames(focus.x.mergedDataRaw), rownames(pca.focus.x.mergedDataRaw$x))]) %>%
+  ggplot(aes(x=PC1,y=PC2)) + geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  # theme_bw(base_size=32) + 
+  labs(x=paste0("PC1: ",round(var_explained[1]*100,1),"%"),
+       y=paste0("PC2: ",round(var_explained[2]*100,1),"%")) +
+  theme(legend.position="top", legend.text = element_text(size=10), text = element_text(size = 20), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.mergedDataRaw), segment.color = 'grey50')
+
+# ggsave('output_YL/focus2_mergedDataRaw_pca.png')
+
+###########################
+
+pca.focus.x.cleanData0 <- prcomp(focus.x.cleanData0[,-1:-3], center=FALSE, scale.=FALSE, retx=TRUE)
+# summary(pca.focus.x.cleanData0)
+
+eigen.value <- pca.focus.x.cleanData0$sdev^2
+var_explained <- eigen.value / sum(eigen.value)
+plot(var_explained, type = 'o', xlab = 'Principle Component (PC)', ylab = 'Variance Explained')
+
+pca.focus.x.cleanData0$x %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData0$Disease[match(rownames(focus.x.cleanData0), rownames(pca.focus.x.cleanData0$x))]) %>%
+  ggplot(aes(x=PC1,y=PC2)) + geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  # theme_bw(base_size=32) + 
+  labs(x=paste0("PC1: ",round(var_explained[1]*100,1),"%"),
+       y=paste0("PC2: ",round(var_explained[2]*100,1),"%")) +
+  theme(legend.position="top", legend.text = element_text(size=10), text = element_text(size = 20), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData0), segment.color = 'grey50')
+
+# ggsave('output_YL/focus2_cleanData0_pca.png')
+
+###########################
+
+
+pca.focus.x.cleanData1 <- prcomp(focus.x.cleanData1[,-1:-3], center=FALSE, scale.=FALSE, retx=TRUE)
+# summary(pca.focus.x.cleanData1)
+
+eigen.value <- pca.focus.x.cleanData1$sdev^2
+var_explained <- eigen.value / sum(eigen.value)
+plot(var_explained, type = 'o', xlab = 'Principle Component (PC)', ylab = 'Variance Explained')
+
+pca.focus.x.cleanData1$x %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData1$Disease[match(rownames(focus.x.cleanData1), rownames(pca.focus.x.cleanData1$x))]) %>%
+  ggplot(aes(x=PC1,y=PC2)) + geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  # theme_bw(base_size=32) + 
+  labs(x=paste0("PC1: ",round(var_explained[1]*100,1),"%"),
+       y=paste0("PC2: ",round(var_explained[2]*100,1),"%")) +
+  theme(legend.position="top", legend.text = element_text(size=10), text = element_text(size = 20), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData1), segment.color = 'grey50')
+
+# ggsave('output_YL/focus2_cleanData1_pca.png')
+
+###########################
+
+pca.focus.x.cleanData2 <- prcomp(focus.x.cleanData2[,-1:-3], center=FALSE, scale.=FALSE, retx=TRUE)
+# summary(pca.focus.x.cleanData2)
+
+eigen.value <- pca.focus.x.cleanData2$sdev^2
+var_explained <- eigen.value / sum(eigen.value)
+plot(var_explained, type = 'o', xlab = 'Principle Component (PC)', ylab = 'Variance Explained')
+
+pca.focus.x.cleanData2$x %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData2$Disease[match(rownames(focus.x.cleanData2), rownames(pca.focus.x.cleanData2$x))]) %>%
+  ggplot(aes(x=PC1,y=PC2)) + geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  labs(x=paste0("PC1: ",round(var_explained[1]*100,1),"%"),
+       y=paste0("PC2: ",round(var_explained[2]*100,1),"%")) +
+  theme(legend.position="top", legend.text = element_text(size=10), text = element_text(size = 20), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData2), segment.color = 'grey50')
+
+# ggsave('output_YL/focus2_cleanData2_pca.png')
+
+```
+
+### TSNE of 4 datasets focusing on AOSD and Negative Control
+
+```{r max perplexity 2}
+(nrow(focus.x.cleanData1) - 1) / 3
+```
+
+
+```{r TSNE - focus2} 
+
+tsne.focus.x.mergedDataRaw <- focus.x.mergedDataRaw %>% select(where(is.numeric)) %>%
+  Rtsne(normalize = FALSE, initial_dims = 5, perplexity = 6, max_iter = 5000) 
+
+tsne.focus.x.mergedDataRaw$Y %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.mergedDataRaw$Disease) %>% 
+  rename(tSNE1="V1", tSNE2="V2") %>%
+  ggplot(aes(x = tSNE1, y = tSNE2)) +
+  geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  theme(legend.position="top", legend.text = element_text(size=8), text = element_text(size = 15), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.mergedDataRaw), segment.color = 'grey50')
+
+# ggsave('output_YL/focus2_mergedDataRaw_tsne.png')
+
+#######################
+
+tsne.focus.x.cleanData0 <- focus.x.cleanData0 %>% select(where(is.numeric)) %>%
+  Rtsne(normalize = FALSE, initial_dims = 5, perplexity = 6, max_iter = 5000) 
+
+tsne.focus.x.cleanData0$Y %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData0$Disease) %>% 
+  rename(tSNE1="V1", tSNE2="V2") %>%
+  ggplot(aes(x = tSNE1, y = tSNE2)) +
+  geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  theme(legend.position="top", legend.text = element_text(size=8), text = element_text(size = 15), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData0), segment.color = 'grey50')
+
+# ggsave('output_YL/focus2_cleanData0_tsne.png')
+
+#######################
+
+tsne.focus.x.cleanData1 <- focus.x.cleanData1 %>% select(where(is.numeric)) %>%
+  Rtsne(normalize = FALSE, initial_dims = 5, perplexity = 6, max_iter = 5000) 
+
+tsne.focus.x.cleanData1$Y %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData1$Disease) %>% 
+  rename(tSNE1="V1", tSNE2="V2") %>%
+  ggplot(aes(x = tSNE1, y = tSNE2)) +
+  geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  theme(legend.position="top", legend.text = element_text(size=8), text = element_text(size = 15), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData1), segment.color = 'grey50')
+
+# ggsave('output_YL/focus2_cleanData1_tsne.png')
+
+#####################
+
+tsne.focus.x.cleanData2 <- focus.x.cleanData2 %>% select(where(is.numeric)) %>%
+  Rtsne(normalize = FALSE, initial_dims = 5, perplexity = 6, max_iter = 5000) 
+
+tsne.focus.x.cleanData2$Y %>% 
+  as.data.frame %>%
+  mutate(Disease = focus.x.cleanData2$Disease) %>% 
+  rename(tSNE1="V1", tSNE2="V2") %>%
+  ggplot(aes(x = tSNE1, y = tSNE2)) +
+  geom_point(aes(color=Disease),size=4) +
+  scale_color_manual(values = anno_colors$Disease[names(anno_colors$Disease) %in% focus]) +
+  theme(legend.position="top", legend.text = element_text(size=8), text = element_text(size = 15), legend.title=element_blank()) + 
+  geom_text_repel(label = rownames(focus.x.cleanData2), segment.color = 'grey50')
+
+# ggsave('output_YL/focus2_cleanData2_tsne.png')
+
+```
+
+
+## DE analysis - focus on FMF/AOSD 
+### Load datasets
+```{r}
+# mergedDataRaw <- readRDS(mergedDataRaw, file = "output_YL/mergedDataRaw.rds")
+# cleanData0 <- readRDS(cleanData0, file = "output_YL/cleanData0.rds")
+# cleanData1 <- readRDS(cleanData1, file = "output_YL/cleanData1.rds")
+# cleanData2 <- readRDS(cleanData2, file = "output_YL/cleanData2.rds")
+
+lookup <- getAnalyteInfo(mergedDataRaw) %>% filter(Organism == 'Human', Type == 'Protein') %>% select(AptName, UniProt, Target, TargetFullName) 
+
+```
+
+
+
+### All disease vs. Negative Control
+```{r}
+ourData <- mergedDataRaw
+rownames(ourData) <- mergedDataRaw$SampleId
+
+opar <-par(mar=c(5.1,20.1,4.1,2.1))
+bp <- barplot(rev(sort(table(ourData$Disease))), main = paste0("# of Patients (N = ", dim(ourData)[1], ")"), cex.names=0.8, xlab = "Frequency", horiz = TRUE, las = "2")
+# text(bp, 3, rev(sort(table(ourData$Disease))),  cex = .8, srt = 90)
+
+par(opar)
+```
+```{r mergedDataRaw - all diseases & NegCtrl }
+
+ourData <- mergedDataRaw[,names(mergedDataRaw) %in% c(lookup$AptName, 'Disease')] 
+rownames(ourData) <- mergedDataRaw$SampleId
+
+ourData$Disease[ourData$Disease != "Negative control"] <- "SAID"
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+
+# standard limma model fit
+group <- ourData$Disease
+# design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples
+# head(ourData)
+
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("SAID", "NegCtrl")
+# head(design2)
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="SAID-NegCtrl", levels = design2)
+# contrast.matrix
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+# topTable(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+# genename
+
+# png('output_YL/DE_all_mergedDataRaw.png')
+
+volcanoplot(fit2C, coef="Diff.1", main="mergedDataRaw : SAID-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+
+# dev.off()
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+```
+
+```{r cleanData0 - all disease & NegCtrl }
+ourData <- cleanData0[,names(cleanData0) %in% c(lookup$AptName, 'Disease')] 
+rownames(ourData) <- cleanData0$SampleId
+
+ourData$Disease[ourData$Disease != "Negative control"] <- "SAID"
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+
+# standard limma model fit
+group <- ourData$Disease
+design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples
+
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("SAID", "NegCtrl")
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="SAID-NegCtrl", levels = design2)
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+
+# png('output_YL/DE_all_cleanData0.png')
+volcanoplot(fit2C, coef="Diff.1", main="cleanData0 : SAID-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+# dev.off()
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df1 <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+df <- cbind(df, df1)
+```
+
+```{r cleanData1 - all diseases & NegCtrl }
+ourData <- cleanData1[,names(cleanData1) %in% c(lookup$AptName, 'Disease')] 
+rownames(ourData) <- cleanData1$SampleId
+
+ourData$Disease[ourData$Disease != "Negative control"] <- "SAID"
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+
+# standard limma model fit
+group <- ourData$Disease
+design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("SAID", "NegCtrl")
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="SAID-NegCtrl", levels = design2)
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+
+# png('output_YL/DE_all_cleanData1.png')
+volcanoplot(fit2C, coef="Diff.1", main="cleanData1 : SAID-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+# dev.off()
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df1 <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+df <- cbind(df, df1)
+
+```
+
+```{r cleanData2 - all diseases & NegCtrl }
+ourData <- cleanData2[,names(cleanData2) %in% c(lookup$AptName, 'Disease')] 
+rownames(ourData) <- cleanData2$SampleId
+
+ourData$Disease[ourData$Disease != "Negative control"] <- "SAID"
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+
+# standard limma model fit
+group <- ourData$Disease
+design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples
+
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("SAID", "NegCtrl")
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="SAID-NegCtrl", levels = design2)
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+
+# png('output_YL/DE_all_cleanData2.png')
+
+volcanoplot(fit2C, coef="Diff.1", main="cleanData2 : SAID-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+
+# dev.off()
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df1 <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+df <- cbind(df, df1)
+
+```
+
+### FMF vs. Negative Control
+```{r}
+focus <- c("FMF", "Negative control")
+ourData <- mergedDataRaw[mergedDataRaw$Disease %in% focus, names(mergedDataRaw) %in% c(lookup$AptName, 'Disease')]
+# opar <-par(mar=c(5.1,20.1,4.1,2.1))
+bp <- barplot(rev(sort(table(ourData$Disease))), main = paste0("# of Patients (N = ", dim(ourData)[1], ")"), cex.names=0.8, xlab = "Frequency")
+text(bp, 3, rev(sort(table(ourData$Disease))),  cex = .8)
+```
+
+```{r mergedDataRaw - FMF & NegCtrl }
+
+ourData <- mergedDataRaw[mergedDataRaw$Disease %in% focus, names(mergedDataRaw) %in% c(lookup$AptName, 'Disease')]
+rownames(ourData) <- mergedDataRaw$SampleId[mergedDataRaw$Disease %in% focus]
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+
+# standard limma model fit
+group <- ourData$Disease
+design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples
+# head(ourData)
+
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("FMF", "NegCtrl")
+# head(design2)
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="FMF-NegCtrl", levels = design2)
+# contrast.matrix
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+# topTable(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+# genename
+
+# png('output_YL/DE_focus1_mergedDataRaw.png')
+
+volcanoplot(fit2C, coef="Diff.1", main="mergedDataRaw : FMF-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+
+# dev.off()
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df1 <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+df <- cbind(df, df1)
+```
+
+```{r cleanData0 - FMF & NegCtrl }
+ourData <- cleanData0[cleanData0$Disease %in% focus, names(cleanData0) %in% c(lookup$AptName, 'Disease')]
+rownames(ourData) <- cleanData0$SampleId[cleanData0$Disease %in% focus]
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+
+# standard limma model fit
+group <- ourData$Disease
+design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples
+# head(ourData)
+
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("FMF", "NegCtrl")
+# head(design2)
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="FMF-NegCtrl", levels = design2)
+# contrast.matrix
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+# topTable(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+# genename
+
+# png('output_YL/DE_focus1_cleanData0.png')
+
+volcanoplot(fit2C, coef="Diff.1", main="cleanData0 : FMF-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+
+# dev.off()
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df1 <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+df <- cbind(df, df1)
+```
+
+```{r cleanData1 - FMF & NegCtrl }
+ourData <- cleanData1[cleanData1$Disease %in% focus, names(cleanData1) %in% c(lookup$AptName, 'Disease')]
+rownames(ourData) <- cleanData1$SampleId[cleanData1$Disease %in% focus]
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+
+# standard limma model fit
+group <- ourData$Disease
+design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples
+# head(ourData)
+
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("FMF", "NegCtrl")
+# head(design2)
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="FMF-NegCtrl", levels = design2)
+# contrast.matrix
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+# topTable(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+# genename
+
+# png('output_YL/DE_focus1_cleanData1.png')
+
+volcanoplot(fit2C, coef="Diff.1", main="cleanData1 : FMF-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+
+# dev.off()
+
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df1 <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+df <- cbind(df, df1)
+
+```
+
+```{r cleanData2 - FMF & NegCtrl }
+
+ourData <- cleanData2[cleanData2$Disease %in% focus, names(cleanData2) %in% c(lookup$AptName, 'Disease')]
+rownames(ourData) <- cleanData2$SampleId[cleanData2$Disease %in% focus]
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+
+# standard limma model fit
+group <- ourData$Disease
+design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples
+# head(ourData)
+
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("FMF", "NegCtrl")
+# head(design2)
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="FMF-NegCtrl", levels = design2)
+# contrast.matrix
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+# topTable(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+# genename
+
+# png('output_YL/DE_focus1_cleanData2.png')
+
+volcanoplot(fit2C, coef="Diff.1", main="cleanData2: FMF-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+
+# dev.off()
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df1 <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+df <- cbind(df, df1)
+```
+
+
+### DE analysis - AOSD & NegCtrl 
+```{r}
+focus <- c("Adult-Onset Still’s Disease", "Negative control")
+ourData <- mergedDataRaw[mergedDataRaw$Disease %in% focus,]
+# opar <-par(mar=c(5.1,20.1,4.1,2.1))
+bp <- barplot(rev(sort(table(ourData$Disease))), main = paste0("# of Patients (N = ", dim(ourData)[1], ")"), cex.names=0.8, xlab = "Frequency")
+text(bp, 3, rev(sort(table(ourData$Disease))),  cex = .8)
+```
+
+```{r mergedDataRaw - AOSD & NegCtrl }
+ourData <- mergedDataRaw[mergedDataRaw$Disease %in% focus, names(mergedDataRaw) %in% c(lookup$AptName, 'Disease')]
+rownames(ourData) <- mergedDataRaw$SampleId[mergedDataRaw$Disease %in% focus]
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+# standard limma model fit
+group <- ourData$Disease
+design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples 
+# head(ourData)
+
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("AOSD", "NegCtrl")
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="AOSD-NegCtrl", levels = design2)
+# contrast.matrix
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+# topTable(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+# genename
+
+# png('output_YL/DE_focus2_mergedDataRaw.png')
+
+volcanoplot(fit2C, coef="Diff.1", main="mergedDataRaw : AOSD-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+
+# dev.off()
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df1 <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+df <- cbind(df, df1)
+```
+
+```{r cleanData0 - AOSD & NegCtrl }
+ourData <- cleanData0[cleanData0$Disease %in% focus, names(cleanData0) %in% c(lookup$AptName, 'Disease')]
+rownames(ourData) <- cleanData0$SampleId[cleanData0$Disease %in% focus]
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+
+# standard limma model fit
+group <- ourData$Disease
+design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples 
+# head(ourData)
+
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("AOSD", "NegCtrl")
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="AOSD-NegCtrl", levels = design2)
+# contrast.matrix
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+# topTable(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+# genename
+
+# png('output_YL/DE_focus2_cleanData0.png')
+
+volcanoplot(fit2C, coef="Diff.1", main="cleanData0 : AOSD-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+
+# dev.off()
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df1 <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+df <- cbind(df, df1)
+```
+
+```{r cleanData1 - AOSD & NegCtrl }
+ourData <- cleanData1[cleanData1$Disease %in% focus, names(cleanData1) %in% c(lookup$AptName, 'Disease')]
+rownames(ourData) <- cleanData1$SampleId[cleanData1$Disease %in% focus]
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+
+# standard limma model fit
+group <- ourData$Disease
+design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples 
+# head(ourData)
+
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("FMF", "NegCtrl")
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="FMF-NegCtrl", levels = design2)
+# contrast.matrix
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+# topTable(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+# genename
+
+# png('output_YL/DE_focus2_cleanData1.png')
+
+volcanoplot(fit2C, coef="Diff.1", main="cleanData1 : FMF-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+
+# dev.off()
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df1 <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+df <- cbind(df, df1)
+```
+
+```{r cleanData2 - AOSD & NegCtrl }
+ourData <- cleanData2[cleanData2$Disease %in% focus, names(cleanData2) %in% c(lookup$AptName, 'Disease')]
+rownames(ourData) <- cleanData2$SampleId[cleanData2$Disease %in% focus]
+ourData$Disease <- factor(ourData$Disease)
+colnames(ourData) <- names(ourData)
+
+
+# standard limma model fit
+group <- ourData$Disease
+design <- model.matrix(~ group)
+
+ourData <- data.frame(t(ourData[,-dim(ourData)[2]])) # col = samples 
+# head(ourData)
+
+design2 <- model.matrix(~ group - 1)
+colnames(design2) <- c("FMF", "NegCtrl")
+
+fit2 <- lmFit(ourData, design2)
+contrast.matrix <- makeContrasts(Diff.1 ="FMF-NegCtrl", levels = design2)
+# contrast.matrix
+
+fit2C <- contrasts.fit(fit2, contrast.matrix)
+fit2C <- eBayes(fit2C)
+# topTable(fit2C)
+
+genename <- rownames(topTable(fit2C, n=10))
+# genename
+
+# png('output_YL/DE_focus2_cleanData2.png')
+
+volcanoplot(fit2C, coef="Diff.1", main="cleanData2 : FMF-NegCtrl") 
+lp <- -log10(fit2C$p.value[,"Diff.1"])
+ord <- order(lp, decreasing = TRUE)[1:10]
+# points(fit2C$coef[ord,"Diff.1"], lp[ord], pch = 16, cex = 0.45, col = 2)
+x <- fit2C$coef[ord,"Diff.1"]
+y <- lp[ord]
+text(x, y, lookup$Target[lookup$AptName %in% names(lp[ord])], cex=0.6, col="red")
+
+# dev.off()
+
+lookup$UniProt[lookup$AptName %in% names(lp[ord])]
+lookup$Target[lookup$AptName %in% names(lp[ord])]
+lookup$TargetFullName[lookup$AptName %in% names(lp[ord])]
+
+df1 <- data.frame(lookup$Target[lookup$AptName %in% names(lp[ord])])
+df <- cbind(df, df1)
+```
+
+```{r}
+colnames(df) <- c('mergedDataRaw_all', 'cleanData0_all', 'cleanData1_all', 'cleanData2_all',
+                  'mergedDataRaw_FMF', 'cleanData0_FMF', 'cleanData1_FMF', 'cleanData2_FMF',
+                  'mergedDataRaw_AOSD', 'cleanData0_AOSD', 'cleanData1_AOSD', 'cleanData2_AOSD')
+df
+
+write.csv(df, file = 'output_YL/DE_top10_Target.csv') 
+```
+
+
+
+## Validation w. LC-MS/MS data, eCRF data
+### data wrangling - LC-MS/MS data
+```{r LC-MS/MS data}
+
+# mergedDataRaw <- readRDS(mergedDataRaw, file = "output_YL/mergedDataRaw.rds")
+# cleanData0 <- readRDS(cleanData0, file = "output_YL/cleanData0.rds")
+# cleanData1 <- readRDS(cleanData1, file = "output_YL/cleanData1.rds")
+# cleanData2 <- readRDS(cleanData2, file = "output_YL/cleanData2.rds")
+
+
+dir <- '../../../../raw/Mass_spec_plasma_data/batch1_Proteomics_ULiegeGIGA/batch1_Proteomics_ULiegeGIGA/data/'
+ifiles <- list.files(dir, pattern = ".csv$")
+ifiles
+
+S1 <- read_delim(paste0(dir,ifiles[1]),delim = ",") # 764 x 24
+S2 <- read_delim(paste0(dir,ifiles[2]),delim = ",") # 664 x 24
+
+# keep the row names of S1 
+MSdata <- left_join(S1[names(S1)[c(-22:-24)]], S2[names(S2)[c(1, 4:21)]], by = 'MajorProteinIds') 
+# change column names: 10001A03PL1 --> 10001A
+colnames(MSdata)[c(-1:-3)] <- str_sub(names(MSdata[c(-1:-3)]), start= 1, end = 6)
+
+# MSdata # 764 x 39
+dim(MSdata)
+```
+
+
+```{r data wrangling - SomaScan data}
+
+# get average value of multiple AptNames (per UniProt)
+# lookup <- getAnalyteInfo(mergedDataRaw) %>% filter(Organism == 'Human', Type == 'Protein') %>% select(AptName, UniProt) 
+
+# duplicated UniProt
+length(lookup$UniProt)
+length(unique(lookup$UniProt))
+
+neat.mergedDataRaw <- mergedDataRaw
+rownames(neat.mergedDataRaw) <- mergedDataRaw$SampleId
+
+neat.cleanData0 <- cleanData0
+rownames(neat.cleanData0) <- cleanData0$SampleId
+
+neat.cleanData1 <- cleanData1
+rownames(neat.cleanData1) <- cleanData1$SampleId
+
+neat.cleanData2 <- cleanData2
+rownames(neat.cleanData2) <- cleanData2$SampleId
+
+
+# per sample, average AptNames per UniProt
+avg.mergedDataRaw <- list()
+avg.cleanData0 <- list()
+avg.cleanData1 <- list()
+avg.cleanData2 <- list()
+
+for (i in unique(lookup$UniProt)) {
+  j <- lookup$AptName[lookup$UniProt == i] # one or more AptName
+  gr_mean <- apply(neat.mergedDataRaw[names(neat.mergedDataRaw) %in% j], 1, mean) # row-wise average
+  avg.mergedDataRaw[[i]] <- cbind(mean_RFU= gr_mean)
+  
+  gr_mean <- apply(neat.cleanData0[names(neat.cleanData0) %in% j], 1, mean) 
+  avg.cleanData0[[i]] <- cbind(mean_RFU= gr_mean)
+  
+  gr_mean <- apply(neat.cleanData1[names(neat.cleanData1) %in% j], 1, mean) 
+  avg.cleanData1[[i]] <- cbind(mean_RFU= gr_mean)
+  
+  gr_mean <- apply(neat.cleanData2[names(neat.cleanData2) %in% j], 1, mean) 
+  avg.cleanData2[[i]] <- cbind(mean_RFU= gr_mean)
+}
+
+neat.mergedDataRaw <- data.frame(do.call(cbind,avg.mergedDataRaw))
+neat.cleanData0 <- data.frame(do.call(cbind,avg.cleanData0))
+neat.cleanData1 <- data.frame(do.call(cbind,avg.cleanData1))
+neat.cleanData2 <- data.frame(do.call(cbind,avg.cleanData2))
+
+colnames(neat.mergedDataRaw) <- unique(lookup$UniProt)
+colnames(neat.cleanData0) <- unique(lookup$UniProt)
+colnames(neat.cleanData1) <- unique(lookup$UniProt)
+colnames(neat.cleanData2) <- unique(lookup$UniProt)
+
+# neat.mergedDataRaw
+# neat.cleanData0
+# neat.cleanData1
+# neat.cleanData2
+dim(neat.mergedDataRaw)
+```
+
+
+```{r data wrangling - MS data}
+neat.MSdata <- data.frame(MSdata)
+rownames(neat.MSdata) <- gsub(';', '|', neat.MSdata$MajorProteinIds)
+names(neat.MSdata)[4:39] <- sub("X", "", names(neat.MSdata[,4:39]))
+neat.MSdata <- neat.MSdata[,4:39]
+# neat.MSdata
+
+# if the protein appears less than 50% of all occurrences (samples), we drop the row.
+pct.na <- 100 * (rowSums(is.na(neat.MSdata)) / dim(neat.MSdata)[2])
+protein.select <- names(pct.na)[pct.na < 50]
+protein.select <- intersect(protein.select, names(neat.mergedDataRaw))
+
+neat.MSdata <- data.frame(t(neat.MSdata[protein.select,])) # 36 x 265
+# neat.MSdata
+dim(neat.MSdata)
+```
+
+```{r}
+rowSums(is.na(neat.MSdata))
+```
+
+```{r select samples for correlation with MS/MS data}
+neat.mergedDataRaw <- neat.mergedDataRaw[ rownames(neat.mergedDataRaw) %in% rownames(neat.MSdata) , names(neat.mergedDataRaw) %in% protein.select] 
+
+neat.cleanData0 <- neat.cleanData0[ rownames(neat.cleanData0) %in% rownames(neat.MSdata) , names(neat.cleanData0) %in% protein.select] 
+
+neat.cleanData1 <- neat.cleanData1[ rownames(neat.cleanData1) %in% rownames(neat.MSdata) , names(neat.cleanData1) %in% protein.select] 
+
+neat.cleanData2 <- neat.cleanData2[ rownames(neat.cleanData2) %in% rownames(neat.MSdata) , names(neat.cleanData2) %in% protein.select] 
+
+neat.MSdata <- neat.MSdata[rownames(neat.MSdata) %in% rownames(neat.cleanData2),]
+
+# 122 x 1699 --> 34 x 265
+# neat.mergedDataRaw
+# neat.cleanData0
+# neat.cleanData1
+# neat.cleanData2 
+
+# 36 --> 34
+# neat.MSdata
+
+dim(neat.mergedDataRaw)
+dim(neat.MSdata)
+
+```
+
+```{r align the order of columns and rows}
+col_order <- names(neat.mergedDataRaw)
+row_order <- rownames(neat.mergedDataRaw)
+neat.MSdata <- neat.MSdata[row_order, col_order]
+# neat.MSdata
+```
+```{r save the neat files}
+saveRDS(neat.mergedDataRaw, file = 'output_YL/neat_mergedDataRaw.rds')
+saveRDS(neat.cleanData0, file = 'output_YL/neat_cleanData0.rds')
+saveRDS(neat.cleanData1, file = 'output_YL/neat_cleanData1.rds')
+saveRDS(neat.cleanData2, file = 'output_YL/neat_cleanData2.rds')
+```
+
+
+```{r Sample Correlation}
+
+# mergedDataRaw & MSdata
+sample.cor <- cor(t(neat.mergedDataRaw), t(neat.MSdata), use = "pairwise.complete.obs", method = "pearson")
+cat(range(sample.cor), '\n')
+
+disease_col <- data.frame(Disease = mergedDataRaw$Disease[mergedDataRaw$SampleId %in% rownames(neat.mergedDataRaw)])
+disease_col
+rownames(disease_col) <- rownames(neat.mergedDataRaw)
+
+
+pheatmap(sample.cor,
+         # filename = 'output_YL/MS_mergedDataRaw_correlation_sample.png',
+         main = "Pearson correlation - mergedDataRaw & MSdata",
+         cluster_cols = FALSE, cluster_rows = FALSE, 
+         # clustering_distance_cols = as.dist(1 - sample.cor),
+         # clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE,
+         # annotation_col =  disease_col, annotation_row = disease_col,
+         border_color=FALSE, annotation_colors = anno_colors, fontsize = 8, 
+         color = colorRampPalette(rev(brewer.pal(n=10, name="RdBu")))(100), breaks = seq(-1,1,0.02)
+  )
+
+# manage the height of dendogram
+# treeheight_row = 20, treeheight_col = 20,
+
+# fix the color scale from -1 to 1
+# color = colorRampPalette(rev(brewer.pal(n=10, name="RdBu")))(100), breaks = seq(-1,1,0.025)
+
+########
+
+# cleanData0 & MSdata
+sample.cor <- cor(t(neat.cleanData0), t(neat.MSdata), use = "pairwise.complete.obs", method = "pearson")
+cat(range(sample.cor), '\n')
+
+disease_col <- data.frame(Disease = mergedDataRaw$Disease[mergedDataRaw$SampleId %in% rownames(neat.cleanData0)])
+rownames(disease_col) <- rownames(neat.cleanData0)
+
+pheatmap(sample.cor,
+         # filename = 'output_YL/MS_cleanData0_correlation_sample.png',
+         main = "Pearson correlation - cleanData0 & MSdata",
+         cluster_cols = FALSE, cluster_rows = FALSE, 
+         # clustering_distance_cols = as.dist(1 - sample.cor),
+         # clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE,
+         # annotation_col =  disease_col, annotation_row = disease_col,
+         border_color=FALSE, annotation_colors = anno_colors, fontsize = 8, 
+         color = colorRampPalette(rev(brewer.pal(n=10, name="RdBu")))(100), breaks = seq(-1,1,0.02)
+  )
+
+
+########
+
+# cleanData1 & MSdata
+
+sample.cor <- cor(t(neat.cleanData1), t(neat.MSdata), use = "pairwise.complete.obs", method = "pearson")
+cat(range(sample.cor), '\n')
+
+disease_col <- data.frame(Disease = mergedDataRaw$Disease[mergedDataRaw$SampleId %in% rownames(neat.cleanData1)])
+rownames(disease_col) <- rownames(neat.cleanData1)
+
+pheatmap(sample.cor,
+         # filename = 'output_YL/MS_cleanData1_correlation_sample.png',
+         main = "Pearson correlation - cleanData1 & MSdata",
+         cluster_cols = FALSE, cluster_rows = FALSE, 
+         # clustering_distance_cols = as.dist(1 - sample.cor),
+         # clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE,
+         # annotation_col =  disease_col, annotation_row = disease_col,
+         border_color=FALSE, annotation_colors = anno_colors, fontsize = 8, 
+         color = colorRampPalette(rev(brewer.pal(n=10, name="RdBu")))(100), breaks = seq(-1,1,0.02)
+  )
+
+######
+
+# cleanData2 & MSdata
+
+sample.cor <- cor(t(neat.cleanData2), t(neat.MSdata), use = "pairwise.complete.obs", method = "pearson")
+cat(range(sample.cor), '\n')
+
+disease_col <- data.frame(Disease = mergedDataRaw$Disease[mergedDataRaw$SampleId %in% rownames(neat.cleanData2)])
+rownames(disease_col) <- rownames(neat.cleanData2)
+
+pheatmap(sample.cor,
+         # filename = 'output_YL/MS_cleanData2_correlation_sample.png',
+         main = "Pearson correlation - cleanData2 & MSdata",
+         cluster_cols = FALSE, cluster_rows = FALSE, 
+         # clustering_distance_cols = as.dist(1 - sample.cor),
+         # clustering_distance_rows = as.dist(1 - sample.cor),
+         show_colnames = TRUE, show_rownames = TRUE,
+         # annotation_col =  disease_col, annotation_row = disease_col,
+         border_color=FALSE, annotation_colors = anno_colors, fontsize = 8, 
+         color = colorRampPalette(rev(brewer.pal(n=10, name="RdBu")))(100), breaks = seq(-1,1,0.02)
+  )
+# low correlation between SomaScan data and MS data - perhaps due to limited number of proteins
+```
+
+
+```{r Correlogram}
+library("corrplot")
+# method = c("circle", "square", "ellipse", "number", "shade", "color", "pie"),
+
+# mergedDataRaw & MSdata
+sample.cor <- cor(t(neat.mergedDataRaw)[,c(1:10)], t(neat.MSdata)[,c(1:10)], use = "pairwise.complete.obs", method = "pearson")
+corrplot(sample.cor, method = "ellipse", type= "upper", order= "hclust", tl.col="black", col =  colorRampPalette(rev(brewer.pal(n=10, name="RdBu")))(100), breaks = seq(-1,1,0.02)) 
+# p.mat = p.mat, sig.level = 0.01, insig = "blank"
+
+```
+
+```{r Protein Correlation - ALL 265 proteins}
+# mergedDataRaw & MSdata
+protein.cor <- cor(neat.mergedDataRaw, neat.MSdata, use = "pairwise.complete.obs", method = "pearson")
+cat(range(protein.cor), '\n')
+
+pheatmap(protein.cor,
+         # filename = 'output_YL/MS_mergedDataRaw_correlation_protein.png',
+  main = "Pearson correlation - mergedDataRaw & MSdata",
+  # clustering_distance_cols = as.dist(1 - protein.cor),
+  # clustering_distance_rows = as.dist(1 - protein.cor),
+         show_colnames = FALSE, show_rownames = FALSE,
+         # annotation_col =  disease_col,
+         # annotation_row = disease_col,
+         border_color=FALSE, annotation_colors = anno_colors,
+    fontsize = 8, 
+  color = colorRampPalette(rev(brewer.pal(n=10, name="RdBu")))(100), breaks = seq(-1,1,0.02)
+  )
+######
+
+# cleanData0 & MSdata
+protein.cor <- cor(neat.cleanData0, neat.MSdata, use = "pairwise.complete.obs", method = "pearson")
+cat(range(protein.cor), '\n')
+
+pheatmap(protein.cor,
+         # filename = 'output_YL/MS_cleanData0_correlation_protein.png',
+  main = "Pearson correlation - cleanData0 & MSdata",
+  # clustering_distance_cols = as.dist(1 - protein.cor),
+  # clustering_distance_rows = as.dist(1 - protein.cor),
+         show_colnames = FALSE, show_rownames = FALSE,
+         # annotation_col =  disease_col,
+         # annotation_row = disease_col,
+         border_color=FALSE, annotation_colors = anno_colors,
+    fontsize = 8, 
+  color = colorRampPalette(rev(brewer.pal(n=10, name="RdBu")))(100), breaks = seq(-1,1,0.02)
+  )
+######
+# cleanData1 & MSdata
+protein.cor <- cor(neat.cleanData1, neat.MSdata, use = "pairwise.complete.obs", method = "pearson")
+cat(range(protein.cor), '\n')
+
+pheatmap(protein.cor,
+         # filename = 'output_YL/MS_cleanData1_correlation_protein.png',
+  main = "Pearson correlation - cleanData1 & MSdata",
+  # clustering_distance_cols = as.dist(1 - protein.cor),
+  # clustering_distance_rows = as.dist(1 - protein.cor),
+         show_colnames = FALSE, show_rownames = FALSE,
+         # annotation_col =  disease_col,
+         # annotation_row = disease_col,
+         border_color=FALSE, annotation_colors = anno_colors,
+    fontsize = 8, 
+  color = colorRampPalette(rev(brewer.pal(n=10, name="RdBu")))(100), breaks = seq(-1,1,0.02)
+  )
+######
+
+# cleanData2 & MSdata
+protein.cor <- cor(neat.cleanData2, neat.MSdata[,match(colnames(neat.cleanData2),colnames(neat.MSdata))], use = "pairwise.complete.obs", method = "pearson")
+cat(range(diag(protein.cor)), '\n')
+
+plot(sort(diag(protein.cor)))
+
+pheatmap(protein.cor,
+         # filename = 'output_YL/MS_cleanData2_correlation_protein.png',
+  main = "Pearson correlation - cleanData2 & MSdata",
+  # clustering_distance_cols = as.dist(1 - protein.cor),
+  # clustering_distance_rows = as.dist(1 - protein.cor),
+         show_colnames = FALSE, show_rownames = FALSE,
+         # annotation_col =  disease_col,
+         # annotation_row = disease_col,
+         border_color=FALSE, annotation_colors = anno_colors,
+    fontsize = 8, 
+  color = colorRampPalette(rev(brewer.pal(n=10, name="RdBu")))(100), breaks = seq(-1,1,0.02)
+  )
+
+```
+
+### Correlation on CRP, SAA proteins, MSdata vs. SomaScan RFU
+```{r function - p.value matrix}
+# http://www.sthda.com/english/wiki/visualize-correlation-matrix-using-correlogram
+# mat : is a matrix of data
+# ... : further arguments to pass to the native R cor.test function
+cor.mtest <- function(mat, ...) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat<- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], ...)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+        }
+    }
+  colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+  p.mat
+}
+
+```
+```{r UniProt ID of CRP, SAA}
+getAnalyteInfo(mergedDataRaw)[getAnalyteInfo(mergedDataRaw)$Target %in% c('CRP', 'SAA'),]
+```
+
+
+```{r CRP correlation SomaScan data vs. MSdata}
+
+corr <- cor(neat.mergedDataRaw$P02741, neat.MSdata$P02741, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.mergedDataRaw$P02741, neat.MSdata$P02741))
+# cor.test(neat.mergedDataRaw$P02741, neat.MSdata$P02741, method = "pearson")$p.value # 2.95255e-05
+# pval < 0.001
+# png('output_YL/corr_CRP_mergedDataRaw_MSdata.png')
+plot(neat.mergedDataRaw$P02741, neat.MSdata$P02741, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="CRP level from MSdata (LFQ)", main = paste0(
+  'CRP protein - mergedDataRaw vs. MSdata (R = ', round(corr,3), ", p-value < 0.001)"
+  ))
+# dev.off()
+# ", p-value = ", round(mean(pval),5), ")"
+# ", p-value < 0.001)"
+
+corr <- cor(neat.cleanData0$P02741, neat.MSdata$P02741, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.cleanData0$P02741, neat.MSdata$P02741))
+# cor.test(neat.cleanData0$P02741, neat.MSdata$P02741, method = "pearson")$p.value # 2.95255e-05
+# pval < 0.001
+# png('output_YL/corr_CRP_cleanData0_MSdata.png')
+plot(neat.cleanData0$P02741, neat.MSdata$P02741, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="CRP level from MSdata (LFQ)", main = paste0(
+  'CRP protein - cleanData0 vs. MSdata (R = ', round(corr,3), ", p-value < 0.001)"
+  ))
+# dev.off()
+corr <- cor(neat.cleanData1$P02741, neat.MSdata$P02741, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.cleanData1$P02741, neat.MSdata$P02741))
+# cor.test(neat.cleanData1$P02741, neat.MSdata$P02741, method = "pearson")$p.value # 0.00041724
+# pval < 0.001
+# png('output_YL/corr_CRP_cleanData1_MSdata.png')
+plot(neat.cleanData1$P02741, neat.MSdata$P02741, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="CRP level from MSdata (LFQ)", main = paste0(
+  'CRP protein - cleanData1 vs. MSdata (R = ', round(corr, 3), ", p-value < 0.001)"
+))
+# dev.off()
+
+corr <- cor(neat.cleanData2$P02741, neat.MSdata$P02741, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.cleanData2$P02741, neat.MSdata$P02741)) 
+# cor.test(neat.cleanData2$P02741, neat.MSdata$P02741, method = "pearson")$p.value # 0.00041724
+# pval < 0.001
+# png('output_YL/corr_CRP_cleanData2_MSdata.png')
+plot(neat.cleanData2$P02741, neat.MSdata$P02741, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="CRP level from MSdata (LFQ)", main = paste0(
+  'CRP protein - cleanData2 vs. MSdata (R = ', round(corr,3), ", p-value < 0.001)"
+))
+# dev.off()
+```
+
+```{r SAA}
+
+# getAnalyteInfo(mergedDataRaw)[getAnalyteInfo(mergedDataRaw)$Target == 'SAA',] # P0DJI8
+corr <- cor(neat.mergedDataRaw$P0DJI8, neat.MSdata$P0DJI8, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.mergedDataRaw$P0DJI8, neat.MSdata$P0DJI8))
+#cor.test(neat.mergedDataRaw$P0DJI8, neat.MSdata$P0DJI8, method = "pearson")$p.value # 1.488786e-09
+pval < 0.001
+# png('output_YL/corr_SAA_mergedDataRaw_MSdata.png')
+plot(neat.mergedDataRaw$P02741, neat.MSdata$P02741, pch=19, xlab="SAA level from SomaScan (RFU)", ylab="SAA level from MSdata (LFQ)", main = paste0(
+  'SAA protein - mergedDataRaw vs. MSdata (R = ', round(corr,3), ", p-value < 0.001)"
+  ))
+# dev.off()
+
+corr <- cor(neat.cleanData0$P0DJI8, neat.MSdata$P0DJI8, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.cleanData0$P0DJI8, neat.MSdata$P0DJI8))
+#cor.test(neat.cleanData0$P0DJI8, neat.MSdata$P0DJI8, method = "pearson")$p.value # 1.488786e-09
+# pval < 0.001
+# png('output_YL/corr_SAA_cleanData0_MSdata.png')
+plot(neat.cleanData0$P02741, neat.MSdata$P02741, pch=19, xlab="SAA level from SomaScan (RFU)", ylab="SAA level from MSdata (LFQ)", main = paste0(
+  'SAA protein - cleanData0 vs. MSdata (R = ', round(corr,3), ", p-value < 0.001)"
+  ))
+# dev.off()
+
+corr <- cor(neat.cleanData1$P0DJI8, neat.MSdata$P0DJI8, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.cleanData1$P0DJI8, neat.MSdata$P0DJI8))
+  #cor.test(neat.cleanData1$P0DJI8, neat.MSdata$P0DJI8, method = "pearson")$p.value # 2.989646e-11
+# pval < 0.001
+# png('output_YL/corr_SAA_cleanData1_MSdata.png')
+plot(neat.mergedDataRaw$P02741, neat.MSdata$P02741, pch=19, xlab="SAA level from SomaScan (RFU)", ylab="SAA level from MSdata (LFQ)", main = paste0(
+  'SAA protein - cleanData1 vs. MSdata (R = ', round(corr,3), ", p-value < 0.001)"
+  ))
+# dev.off()
+
+corr <- cor(neat.cleanData2$P0DJI8, neat.MSdata$P0DJI8, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.cleanData2$P0DJI8, neat.MSdata$P0DJI8))
+  #cor.test(neat.cleanData2$P0DJI8, neat.MSdata$P0DJI8, method = "pearson")$p.value # 1.58944e-10
+# pval < 0.001
+# png('output_YL/corr_SAA_cleanData2_MSdata.png')
+plot(neat.mergedDataRaw$P02741, neat.MSdata$P02741, pch=19, xlab="SAA level from SomaScan (RFU)", ylab="SAA level from MSdata (LFQ)", main = paste0(
+  'SAA protein - cleanData2 vs. MSdata (R = ', round(corr,3), ", p-value < 0.001)"
+  ))
+# dev.off()
+```
+
+### Correlation on CRP, SAA proteins, eCRF vs. MSdata/SomaScan RFU
+
+```{r CRP correlation eCRF vs. MSdata}
+corr <- cor(neat.MSdata$P02741, mergedDataRaw[ match(rownames(neat.MSdata),mergedDataRaw$SampleId), ]$CRP, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.MSdata$P02741, mergedDataRaw[match(rownames(neat.MSdata),mergedDataRaw$SampleId), ]$CRP))
+# pval < 0.001
+# png('output_YL/corr_CRP_MSdata_eCRF.png')
+plot(neat.MSdata$P02741, mergedDataRaw[ match(rownames(neat.MSdata),mergedDataRaw$SampleId), ]$CRP, pch=19, xlab="CRP level from MSdata (LFQ)", ylab="CRP level from eCRF (mg/L)", 
+     main = paste0("CRP protein - mergedDataRaw vs. eCRF", " (R = ", round(corr, 3), ", p-value = ", round(mean(pval),5), ")"))
+# dev.off()
+
+```
+
+```{r Correlation on CRP; eCRF vs. SomaScan RFU}
+crp.rfu <- getAnalyteInfo(mergedDataRaw)[getAnalyteInfo(mergedDataRaw)$Target %in% c('CRP'),]$AptName 
+corr <- cor(mergedDataRaw[,crp.rfu], mergedDataRaw$CRP, use = "complete.obs", method = "pearson")
+pval <- cor.test(mergedDataRaw[,crp.rfu], mergedDataRaw$CRP, method = "pearson")$p.value
+# pval < 0.001
+# png('output_YL/corr_CRP_mergedDataRaw_eCRF.png')
+plot(mergedDataRaw[,crp.rfu], mergedDataRaw$CRP, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="CRP level from eCRF (mg/L)", 
+     main = paste0("CRP protein - mergedDataRaw vs. eCRF", " (R = ", round(corr, 3), ", p-value < 0.001)"))
+# dev.off()
+
+corr <- cor(cleanData0[,crp.rfu], mergedDataRaw$CRP, use = "complete.obs", method = "pearson")
+pval <- cor.test(cleanData0[,crp.rfu], mergedDataRaw$CRP, method = "pearson")$p.value
+# pval < 0.001
+# png('output_YL/corr_CRP_cleanData0_eCRF.png')
+plot(cleanData0[,crp.rfu], mergedDataRaw$CRP, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="CRP level from eCRF (mg/L)", 
+     main = paste0("CRP protein - cleanData0 vs. eCRF", " (R = ", round(corr, 3), ", p-value < 0.001)"))
+# dev.off()
+
+corr <- cor(cleanData1[,crp.rfu], mergedDataRaw$CRP, use = "complete.obs", method = "pearson")
+pval <- cor.test(cleanData1[,crp.rfu], mergedDataRaw$CRP, method = "pearson")$p.value
+# pval < 0.001
+# png('output_YL/corr_CRP_cleanData1_eCRF.png')
+plot(cleanData1[,crp.rfu], mergedDataRaw$CRP, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="CRP level from eCRF (mg/L)", 
+     main = paste0("CRP protein - cleanData1 vs. eCRF", " (R = ", round(corr, 3), ", p-value < 0.001)"))
+# dev.off()
+
+corr <- cor(cleanData2[,crp.rfu], mergedDataRaw$CRP, use = "complete.obs", method = "pearson")
+pval <- cor.test(cleanData2[,crp.rfu], mergedDataRaw$CRP, method = "pearson")$p.value
+# pval < 0.001
+# png('output_YL/corr_CRP_cleanData2_eCRF.png')
+plot(cleanData2[,crp.rfu], mergedDataRaw$CRP, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="CRP level from eCRF (mg/L)", 
+     main = paste0("CRP protein - cleanData2 vs. eCRF", " (R = ", round(corr, 3), ", p-value < 0.001)"))
+# dev.off()
+```
+
+### Correlation - CRP vs. SAA 
+```{r CRP vs. SAA}
+
+# SomaScan mergedDataRaw
+corr <- cor(neat.mergedDataRaw$P02741, neat.mergedDataRaw$P0DJI8, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.mergedDataRaw$P02741, neat.mergedDataRaw$P0DJI8)) 
+# pval < 0.001
+# png('output_YL/corr_mergedDataRaw_CRP_SAA.png')
+plot(neat.mergedDataRaw$P02741, neat.mergedDataRaw$P0DJI8, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="SAA level from SomaScan (RFU)", main = paste0(
+  'Correlation CRP & SAA - mergedDataRaw (R = ', round(corr,3), ", p-value < 0.001)"
+))
+# dev.off()
+# SomaScan cleanData0
+corr <- cor(neat.cleanData0$P02741, neat.cleanData0$P0DJI8, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.cleanData0$P02741, neat.cleanData0$P0DJI8))
+# pval < 0.001
+# png('output_YL/corr_cleanData0_CRP_SAA.png')
+plot(neat.cleanData0$P02741, neat.cleanData0$P0DJI8, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="SAA level from SomaScan (RFU)", main = paste0(
+  'Correlation CRP & SAA - cleanData0 (R = ', round(corr,3), ", p-value < 0.001)"
+))
+# dev.off()
+# SomaScan cleanData1
+corr <- cor(neat.cleanData1$P02741, neat.cleanData1$P0DJI8, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.cleanData1$P02741, neat.cleanData1$P0DJI8))
+# pval < 0.001
+# png('output_YL/corr_cleanData1_CRP_SAA.png')
+plot(neat.cleanData1$P02741, neat.cleanData1$P0DJI8, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="SAA level from SomaScan (RFU)", main = paste0(
+  'Correlation CRP & SAA - cleanData1 (R = ', round(corr,3), ", p-value < 0.001)"
+))
+# dev.off()
+
+# SomaScan cleanData2
+corr <- cor(neat.cleanData2$P02741, neat.cleanData2$P0DJI8, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.cleanData2$P02741, neat.cleanData2$P0DJI8))
+# pval < 0.001
+# png('output_YL/corr_cleanData2_CRP_SAA.png')
+plot(neat.cleanData2$P02741, neat.cleanData2$P0DJI8, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="SAA level from SomaScan (RFU)", main = paste0(
+  'Correlation CRP & SAA - cleanData2 (R = ', round(corr,3), ", p-value < 0.001)"
+))
+# dev.off()
+
+# MSdata
+corr <- cor(neat.MSdata$P02741, neat.MSdata$P0DJI8, use = "pairwise.complete.obs", method = "pearson")
+pval <- cor.mtest(cbind.data.frame(neat.MSdata$P02741, neat.MSdata$P0DJI8))
+# pval < 0.001
+
+# png('output_YL/corr_MSdata_CRP_SAA.png')
+plot(neat.MSdata$P02741, neat.MSdata$P0DJI8, pch=19, xlab="CRP level from SomaScan (RFU)", ylab="SAA level from SomaScan (RFU)", main = paste0(
+  'Correlation CRP & SAA - MSdata (R = ', round(corr,3), ", p-value < 0.001)"
+))
+# dev.off()
+```
+
