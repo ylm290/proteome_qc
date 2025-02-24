@@ -1,7 +1,7 @@
-MSc Minor Research Project
+# MSc Minor Research Project
 Assessing plasma protein expression levels from patients with systemic autoinflammatory diseases and establishing outlier-based quality control and normalization workflow for the SomaScan® assay
 
-*Abstract*
+*Abstract* \
 Clinical characteristics of patients who are diagnosed with systemic autoinflammatory diseases (SAID) are very similar. The disease-defining biomarkers have yet to be determined. SomaScan assay v4.1 utilizes libraries of affinity reagents (i.e., Slow Off-Rate Modified Aptamers, or analytes) and enables simultaneous profiling of 7,288 human plasma proteins. An in-depth investigation is
 necessary to establish a bespoke data processing workflow in the context of the SAID cohort (N = 144) as the protein content differs in various age and disease groups. 
 
